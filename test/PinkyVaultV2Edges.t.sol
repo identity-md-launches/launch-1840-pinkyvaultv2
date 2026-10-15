@@ -96,10 +96,26 @@ contract PinkyVaultV2EdgesTest is Test {
         return _settleAs(id, watcher);
     }
 
+    /// @dev Two calls, as on chain: the first closes at the head, the second asks 32 blocks later.
     function _settleAs(uint256 id, address who) internal returns (bytes32 requestId) {
         _due();
         vm.prank(who);
+        assertEq(vault.settle(id), bytes32(0), "a settle that closes asks nothing");
+        _confirmed();
+        vm.prank(who);
         requestId = vault.settle(id);
+    }
+
+    /// @dev The 32 blocks the oracle wants behind the closing block.
+    function _confirmed() internal {
+        vm.roll(vm.getBlockNumber() + vault.SETTLE_DELAY_BLOCKS());
+    }
+
+    /// @dev Both settle calls on any vault, by this contract, once the promise is due.
+    function _settleOn(PinkyVaultV2 v, uint256 id) internal returns (bytes32 requestId) {
+        assertEq(v.settle(id), bytes32(0));
+        _confirmed();
+        requestId = v.settle(id);
     }
 
     function _window(uint256 id) internal view returns (uint64 startBlock, uint64 endBlock) {
@@ -374,6 +390,9 @@ contract PinkyVaultV2EdgesTest is Test {
         uint256 a1 = _keep();
         uint256 a2 = _keep();
         _due();
+        vault.settle(a1);
+        vault.settle(a2);
+        _confirmed();
         bytes32 r1 = vault.settle(a1);
         bytes32 r2 = vault.settle(a2);
         OracleAttestation.Attestation memory a = _uint(a1, 0);
@@ -469,6 +488,9 @@ contract PinkyVaultV2EdgesTest is Test {
         uint256 keep = _keep();
         uint256 hold = _make(PinkyVaultV2.Kind.Hold, address(0), address(0));
         _due();
+        vault.settle(keep);
+        vault.settle(hold);
+        _confirmed();
         bytes32 rk = vault.settle(keep);
         bytes32 rh = vault.settle(hold);
         // Too short, too long, empty.
@@ -533,7 +555,7 @@ contract PinkyVaultV2EdgesTest is Test {
         ];
         _due();
         for (uint256 i; i < 4; ++i) {
-            bytes32 requestId = vault.settle(ids[i]);
+            bytes32 requestId = _settleOn(vault, ids[i]);
             OracleAttestation.Attestation memory a = i == 2
                 ? _attestation(ids[i], OracleAttestation.ANSWER_BOOL, abi.encode(false), 1)
                 : _uint(ids[i], AMOUNT + 1);
@@ -569,6 +591,92 @@ contract PinkyVaultV2EdgesTest is Test {
     }
 
     // ───────────────────────── asking ─────────────────────────
+
+    /// `settle` closes an active promise and asks for a closed one; every other state is refused,
+    /// and `close` closes only once.
+    function test_SettleAndCloseRefuseEveryOtherState() public {
+        uint256 id = _keep();
+        _due();
+        vault.close(id);
+        vm.expectRevert(PinkyVaultV2.WrongStatus.selector);
+        vault.close(id);
+        // Closed, but the closing block is not yet 32 blocks deep.
+        vm.roll(vm.getBlockNumber() + vault.SETTLE_DELAY_BLOCKS() - 1);
+        vm.expectRevert(PinkyVaultV2.TooEarly.selector);
+        vault.settle(id);
+        vm.roll(vm.getBlockNumber() + 1);
+        bytes32 requestId = vault.settle(id);
+        vm.expectRevert(PinkyVaultV2.WrongStatus.selector);
+        vault.settle(id);
+        vm.expectRevert(PinkyVaultV2.WrongStatus.selector);
+        vault.close(id);
+        _answerUint(id, requestId, 0);
+        vm.expectRevert(PinkyVaultV2.WrongStatus.selector);
+        vault.settle(id);
+        vault.payout(id);
+        vm.expectRevert(PinkyVaultV2.WrongStatus.selector);
+        vault.settle(id);
+        vm.expectRevert(PinkyVaultV2.WrongStatus.selector);
+        vault.close(id);
+    }
+
+    /// Whoever closes, the window ends at the closing block, never before the block of `make`, and
+    /// the maker alone may close before the grace.
+    /// forge-config: default.fuzz.runs = 512
+    function testFuzz_CloseIsDueAtTheDeadlineForTheMakerOnly(uint256 at, uint256 blocks, uint8 whoRaw) public {
+        uint256 id = _make(PinkyVaultV2.Kind.Keep, address(0), friend);
+        (,,,,,,,,,,,, uint64 endTime,,,,,,,) = vault.promises(id);
+        at = bound(at, uint256(endTime) - 10, uint256(endTime) + vault.CLOSE_GRACE() + 10);
+        blocks = bound(blocks, 0, 1_000);
+        address who = [maker, friend, watcher][whoRaw % 3];
+        vm.warp(at);
+        vm.roll(vm.getBlockNumber() + blocks);
+        uint256 due = uint256(endTime) + (who == maker ? 0 : vault.CLOSE_GRACE());
+        if (at < due) {
+            vm.prank(who);
+            vm.expectRevert(PinkyVaultV2.TooEarly.selector);
+            vault.close(id);
+            assertEq(uint8(_status(id)), uint8(PinkyVaultV2.Status.Active));
+            return;
+        }
+        vm.prank(who);
+        vault.close(id);
+        (uint64 startBlock, uint64 endBlock) = _window(id);
+        assertEq(endBlock, vm.getBlockNumber(), "the window ends at the closing block");
+        assertEq(endBlock - startBlock, blocks);
+        (,,,,,,,,,,,,, uint64 closedAt,,,,,,) = vault.promises(id);
+        assertEq(closedAt, at);
+    }
+
+    /// Before the refund is due anyone may ask; from that second on, only the maker or the
+    /// beneficiary, and a refusal spends nothing.
+    /// forge-config: default.fuzz.runs = 512
+    function testFuzz_OnlyThePartiesAskOnceTheRefundIsDue(uint256 elapsed, uint8 whoRaw) public {
+        uint256 id = _make(PinkyVaultV2.Kind.Keep, address(0), friend);
+        _due();
+        vault.close(id);
+        _confirmed();
+        (,,,,,,,,,,,,, uint64 closedAt,,,,,,) = vault.promises(id);
+        elapsed = bound(elapsed, 0, 2 * vault.REFUND_GRACE());
+        vm.warp(uint256(closedAt) + elapsed);
+        address who = [maker, friend, watcher, owner][whoRaw % 4];
+        bool party = who == maker || who == friend;
+        if (elapsed >= vault.REFUND_GRACE() && !party) {
+            vm.prank(who);
+            vm.expectRevert(PinkyVaultV2.NotAParty.selector);
+            vault.ask(id);
+            assertEq(_bond(id), BOND);
+            assertEq(_attempts(id), 0);
+            // The refund is open to anyone and pays the maker.
+            vault.refund(id);
+            assertEq(imd.balanceOf(maker), 100 ether);
+            return;
+        }
+        vm.prank(who);
+        vault.ask(id);
+        assertEq(_bond(id), BOND - PRICE);
+        assertEq(_asker(id), who);
+    }
 
     function test_AskRefusesEveryStateButClosedAndAsked() public {
         uint256 id = _keep();
@@ -626,10 +734,11 @@ contract PinkyVaultV2EdgesTest is Test {
         vault.proposeProtocol(address(closed), ACTION);
         _enact(PinkyVaultV2.Setting.Protocol);
         _due();
+        assertEq(vault.settle(id), bytes32(0), "the first settle only closes and calls no Intake");
+        _confirmed();
         vm.expectRevert("intake closed");
         vault.settle(id);
-        assertEq(uint8(_status(id)), uint8(PinkyVaultV2.Status.Active), "a settle that cannot ask closes nothing");
-        vault.close(id);
+        assertEq(uint8(_status(id)), uint8(PinkyVaultV2.Status.Closed), "a settle that cannot ask stays closed");
         vm.expectRevert("intake closed");
         vault.ask(id);
         assertEq(_bond(id), BOND);
@@ -650,16 +759,21 @@ contract PinkyVaultV2EdgesTest is Test {
         vault.proposeProtocol(address(v1), ACTION);
         _enact(PinkyVaultV2.Setting.Protocol);
         _due();
+        vault.close(id);
+        _confirmed();
         vm.expectRevert();
         vault.settle(id);
-        vault.close(id);
         vm.expectRevert();
         vault.ask(id);
         vm.prank(owner);
         vault.proposeProtocol(address(intake), ACTION);
         _enact(PinkyVaultV2.Setting.Protocol);
         vm.roll(vm.getBlockNumber() + 40_000);
+        // The move back took a week, so the bond could now be refunded and only a party may ask.
         vm.prank(watcher);
+        vm.expectRevert(PinkyVaultV2.NotAParty.selector);
+        vault.ask(id);
+        vm.prank(maker);
         bytes32 requestId = vault.ask(id);
         _answerUint(id, requestId, 0);
         assertEq(uint8(_status(id)), uint8(PinkyVaultV2.Status.Kept));
@@ -674,11 +788,15 @@ contract PinkyVaultV2EdgesTest is Test {
         vault.proposeProtocol(address(short), ACTION);
         _enact(PinkyVaultV2.Setting.Protocol);
         _due();
+        vault.settle(a);
+        vault.settle(b);
+        _confirmed();
         vm.expectRevert(PinkyVaultV2.InvalidPayment.selector);
         vault.settle(a);
         vm.prank(owner);
         vault.proposeProtocol(address(none), ACTION);
         _enact(PinkyVaultV2.Setting.Protocol);
+        vm.prank(maker);
         vm.expectRevert(PinkyVaultV2.InvalidPayment.selector);
         vault.settle(b);
         assertEq(imd.balanceOf(address(vault)), 2 * BOND);
@@ -695,6 +813,9 @@ contract PinkyVaultV2EdgesTest is Test {
         uint256 b = v.make(PinkyVaultV2.Kind.Keep, address(token), 0, address(0), address(0), 1 hours, BOND);
         vm.stopPrank();
         _due();
+        v.settle(a);
+        v.settle(b);
+        _confirmed();
         v.settle(a);
         vm.expectRevert(PinkyVaultV2.DuplicateRequest.selector);
         v.settle(b);
@@ -769,6 +890,7 @@ contract PinkyVaultV2EdgesTest is Test {
         vault.close(id);
         vm.expectRevert(PinkyVaultV2.WrongStatus.selector);
         vault.payout(id);
+        _confirmed();
         vm.prank(watcher);
         vault.ask(id);
         vm.expectRevert(PinkyVaultV2.WrongStatus.selector);
@@ -789,8 +911,9 @@ contract PinkyVaultV2EdgesTest is Test {
         );
         vm.stopPrank();
         _due();
-        vm.prank(watcher);
-        bytes32 requestId = tight.settle(id);
+        vm.startPrank(watcher);
+        bytes32 requestId = _settleOn(tight, id);
+        vm.stopPrank();
         for (uint256 i; i < 2; ++i) {
             vm.warp(vm.getBlockTimestamp() + tight.ANSWER_TIMEOUT());
             vm.prank(watcher);
@@ -837,8 +960,9 @@ contract PinkyVaultV2EdgesTest is Test {
         uint256 id = tight.make(PinkyVaultV2.Kind.Keep, address(token), 0, address(0), address(0), 1 hours, 99);
         vm.stopPrank();
         _due();
-        vm.prank(watcher);
-        bytes32 requestId = tight.settle(id);
+        vm.startPrank(watcher);
+        bytes32 requestId = _settleOn(tight, id);
+        vm.stopPrank();
         (,,,,,,,,, uint256 left,,,,,,,,,,) = tight.promises(id);
         assertEq(left, 98);
         OracleAttestation.Attestation memory a = _uint(1, 0);
@@ -1012,7 +1136,7 @@ contract PinkyVaultV2EdgesTest is Test {
         _due();
         uint256[2] memory ids = [first, second];
         for (uint256 i; i < 2; ++i) {
-            tight.settle(ids[i]);
+            _settleOn(tight, ids[i]);
             vm.warp(vm.getBlockTimestamp() + tight.ANSWER_TIMEOUT());
             bytes32 requestId = tight.ask(ids[i]);
             OracleAttestation.Attestation memory a = _uint(1, 0);
@@ -1135,9 +1259,14 @@ contract PinkyVaultV2EdgesTest is Test {
         bytes memory sig = _sign(a);
         vm.expectRevert(PinkyVaultV2.InvalidAttestation.selector);
         intake.complete(first, a, sig);
-        // After a re-ask under the smaller panel, the smaller panel is enough for any request.
+        // After a re-ask under the smaller panel, the smaller panel is enough for any request. A
+        // week has passed since closing, so only a party may ask again.
+        vm.prank(watcher);
+        vm.expectRevert(PinkyVaultV2.NotAParty.selector);
+        vault.ask(id);
+        vm.prank(maker);
         bytes32 second = vault.ask(id);
-        (, uint16 panel, uint16 quorum,,) = vault.terms(id);
+        (, uint16 panel, uint16 quorum,,,) = vault.terms(id);
         assertEq(panel, 3);
         assertEq(quorum, 2);
         a = _uint(id, 0);
@@ -1149,8 +1278,11 @@ contract PinkyVaultV2EdgesTest is Test {
         second;
     }
 
-    function test_ANewSignerAppliesToPendingRequestsAtOnce() public {
+    /// A rotation applies to requests bought after it. A request already in flight takes an answer
+    /// from the key it was bought under or the new one, and from no third key.
+    function test_ARotatedSignerStillAnswersTheRequestsBoughtUnderIt() public {
         uint256 id = _keep();
+        uint256 later = _keep();
         bytes32 requestId = _settle(id);
         uint256 nextPk = 0xB0B;
         vm.prank(owner);
@@ -1160,14 +1292,53 @@ contract PinkyVaultV2EdgesTest is Test {
         vm.expectRevert(OracleAttestationConsumer.BadSignature.selector);
         intake.complete(requestId, a, byNext);
         _enact(PinkyVaultV2.Setting.Signer);
-        // A week later: a fresh attestation, signed by each key.
+        assertEq(vault.oracleSigner(), vm.addr(nextPk));
+        (,,,,, address boughtUnder) = vault.terms(id);
+        assertEq(boughtUnder, signer, "the request was bought under the old key");
+        // A week later: a fresh attestation. A third key is refused; the old key is still taken.
         a = _uint(id, 0);
-        byNext = _signFor(a, vault, nextPk);
+        bytes memory byThird = _signFor(a, vault, 0xBAD);
+        vm.expectRevert(OracleAttestationConsumer.BadSignature.selector);
+        intake.complete(requestId, a, byThird);
+        intake.complete(requestId, a, _sign(a));
+        assertEq(uint8(_status(id)), uint8(PinkyVaultV2.Status.Kept));
+        // A promise asked after the rotation takes only the new key.
+        vm.prank(maker);
+        vault.close(later);
+        _confirmed();
+        vm.prank(maker);
+        bytes32 laterRequest = vault.ask(later);
+        (,,,,, boughtUnder) = vault.terms(later);
+        assertEq(boughtUnder, vm.addr(nextPk));
+        OracleAttestation.Attestation memory b = _uint(later, 0);
+        bytes memory byOld = _sign(b);
+        vm.expectRevert(OracleAttestationConsumer.BadSignature.selector);
+        intake.complete(laterRequest, b, byOld);
+        intake.complete(laterRequest, b, _signFor(b, vault, nextPk));
+        assertEq(uint8(_status(later)), uint8(PinkyVaultV2.Status.Kept));
+    }
+
+    /// The key is the promise's, not each request's: a re-ask after a rotation moves every request
+    /// the promise still has in flight to the key current at that ask.
+    function test_AReaskAfterARotationMovesThePromiseToTheNewKey() public {
+        uint256 id = _keep();
+        bytes32 first = _settle(id);
+        uint256 nextPk = 0xB0B;
+        vm.prank(owner);
+        vault.proposeSigner(vm.addr(nextPk));
+        _enact(PinkyVaultV2.Setting.Signer);
+        vm.prank(maker);
+        bytes32 second = vault.ask(id);
+        (,,,,, address boughtUnder) = vault.terms(id);
+        assertEq(boughtUnder, vm.addr(nextPk), "the latest ask decides the key");
+        // The first request, answered by the key it was bought under, is now refused.
+        OracleAttestation.Attestation memory a = _uint(id, 0);
         bytes memory byOld = _sign(a);
         vm.expectRevert(OracleAttestationConsumer.BadSignature.selector);
-        intake.complete(requestId, a, byOld);
-        intake.complete(requestId, a, byNext);
+        intake.complete(first, a, byOld);
+        intake.complete(first, a, _signFor(a, vault, nextPk));
         assertEq(uint8(_status(id)), uint8(PinkyVaultV2.Status.Kept));
+        assertEq(vault.promiseIdFor(address(intake), second), id, "the other request is left to time out");
     }
 
     function test_TheOwnerCannotMoveABond() public {

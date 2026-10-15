@@ -2,7 +2,7 @@
 pragma solidity 0.8.26;
 
 import {Test} from "forge-std/Test.sol";
-import {OracleAttestation} from "../src/OracleAttestation.sol";
+import {OracleAttestation, OracleAttestationConsumer} from "../src/OracleAttestation.sol";
 import {PinkyVaultV2} from "../src/PinkyVaultV2.sol";
 import {PinkyStaking} from "../src/PinkyStaking.sol";
 import {MockERC20, MockIntake} from "./mocks/Mocks.sol";
@@ -16,6 +16,7 @@ import {RefusingSink} from "./mocks/MocksV2.sol";
 /// move state. Where the vault must refuse, the refusal is probed, not skipped.
 contract PinkyV2Handler is Test {
     uint256 constant SIGNER_PK = 0xA11CE;
+    uint256 constant NEXT_PK = 0xB0B;
     uint256 constant PRICE = 0.5 ether;
     bytes32 constant ACTION = bytes32("oracle.request@oracle-1");
 
@@ -60,20 +61,23 @@ contract PinkyV2Handler is Test {
     /// @dev Every request a promise paid for, and which of them the Intake has reported failed.
     mapping(uint256 => Req[]) requests;
     mapping(bytes32 => bool) public dead;
+    /// @dev The private key behind each signer the vault may hold.
+    mapping(address => uint256) keyOf;
 
     /// @dev Called at the end of every action: a promise only moves forward, and a settled one
     /// never reopens.
     modifier steps() {
         _;
+        _track();
+    }
+
+    function _track() internal {
         for (uint256 id = 1; id <= vault.count(); ++id) {
             (,,, PinkyVaultV2.Status now_, uint8 attempts, bool paid,,,,,,,,,,,,,,) = vault.promises(id);
             PinkyVaultV2.Status was = lastStatus[id];
             if (now_ != was) {
                 if (was == PinkyVaultV2.Status.Active) {
-                    assertTrue(
-                        now_ == PinkyVaultV2.Status.Closed || now_ == PinkyVaultV2.Status.Asked,
-                        "Active only closes, or settles"
-                    );
+                    assertTrue(now_ == PinkyVaultV2.Status.Closed, "Active only closes: no call both closes and asks");
                 } else if (was == PinkyVaultV2.Status.Closed) {
                     assertTrue(
                         now_ == PinkyVaultV2.Status.Asked || now_ == PinkyVaultV2.Status.Refunded,
@@ -115,6 +119,8 @@ contract PinkyV2Handler is Test {
         other = new MockIntake(address(0xFEE), PRICE);
         otherSink = new PinkyStaking(address(pinky), address(imd));
         refusing = new RefusingSink();
+        keyOf[vm.addr(SIGNER_PK)] = SIGNER_PK;
+        keyOf[vm.addr(NEXT_PK)] = NEXT_PK;
         pinky.mint(staker, 1_000 ether);
         vm.prank(staker);
         pinky.approve(address(staking), type(uint256).max);
@@ -223,6 +229,16 @@ contract PinkyV2Handler is Test {
         assertEq(eta, 0);
     }
 
+    /// @dev The owner rotates the oracle's key between two, through the seven-day delay.
+    function rotateSigner() external steps {
+        address next = vault.oracleSigner() == vm.addr(SIGNER_PK) ? vm.addr(NEXT_PK) : vm.addr(SIGNER_PK);
+        vm.prank(vault.owner());
+        vault.proposeSigner(next);
+        vm.warp(vm.getBlockTimestamp() + vault.SETTINGS_DELAY());
+        vault.enact(PinkyVaultV2.Setting.Signer);
+        assertEq(vault.oracleSigner(), next);
+    }
+
     // ───────────────────────── promises ─────────────────────────
 
     function make(uint256 who, uint8 kindRaw, bool toFriend, bool aboutImd, uint256 bond, uint256 amount, uint256 dur)
@@ -262,7 +278,9 @@ contract PinkyV2Handler is Test {
         vm.stopPrank();
         deposited += bond;
         bondAt[id] = bond;
-        (uint256 maxPrice, uint16 panel, uint16 quorum, address madeUnder, bytes32 action) = vault.terms(id);
+        (uint256 maxPrice, uint16 panel, uint16 quorum, address madeUnder, bytes32 action, address signerAt) =
+            vault.terms(id);
+        assertEq(signerAt, address(0), "no signer until the first ask");
         assertEq(maxPrice, price, "the price seen at make is the cap elsewhere");
         assertEq(madeUnder, address(_current()));
         assertEq(action, ACTION);
@@ -271,103 +289,141 @@ contract PinkyV2Handler is Test {
         assertEq(_bond(id), bond);
     }
 
-    /// @dev Brings the clock and the chain to where `close` is allowed for an active promise.
-    function _ripen(uint256 id) internal {
-        (,,,,,,,,,, uint64 startBlock,, uint64 endTime,,,,,,,) = vault.promises(id);
-        uint256 due = uint256(endTime) + vault.CLOSE_GRACE();
-        if (vm.getBlockTimestamp() < due) vm.warp(due);
-        uint256 need = uint256(startBlock) + vault.SETTLE_DELAY_BLOCKS();
-        if (vm.getBlockNumber() < need) vm.roll(need);
+    function _who(uint256 id, uint8 whoRaw) internal view returns (address) {
+        uint256 w = whoRaw % 3;
+        return w == 0 ? _maker(id) : w == 1 ? friend : watcher;
     }
 
-    function close(uint256 seed) external steps {
-        uint256 id = _pick(seed);
-        if (id == 0 || _status(id) != PinkyVaultV2.Status.Active) return;
+    /// @dev Closes an active promise as `who`, by `close` or by `settle`: the maker from the
+    /// deadline, anyone else two minutes later. A call before that is probed and refused.
+    function _close(uint256 id, address who, bool viaSettle) internal {
         (,,,,,,,,,, uint64 startBlock,, uint64 endTime,,,,,,,) = vault.promises(id);
-        if (vm.getBlockTimestamp() < uint256(endTime) + vault.CLOSE_GRACE()) {
+        uint256 due = uint256(endTime) + (who == _maker(id) ? 0 : vault.CLOSE_GRACE());
+        if (vm.getBlockTimestamp() < due) {
+            vm.prank(who);
             vm.expectRevert(PinkyVaultV2.TooEarly.selector);
-            vault.close(id);
+            if (viaSettle) vault.settle(id);
+            else vault.close(id);
+            vm.warp(due);
         }
-        _ripen(id);
-        vault.close(id);
-        (,,,,,,,,,,, uint64 endBlock,, uint64 closedAt,,,,,,) = vault.promises(id);
-        assertEq(endBlock, vm.getBlockNumber() - vault.SETTLE_DELAY_BLOCKS(), "the window ends 32 blocks back");
+        uint256 held = imd.balanceOf(address(vault));
+        vm.prank(who);
+        if (viaSettle) assertEq(vault.settle(id), bytes32(0), "a settle that closes asks nothing");
+        else vault.close(id);
+        assertEq(imd.balanceOf(address(vault)), held, "closing moves no funds");
+        (,,,, uint8 attempts,,,,,,, uint64 endBlock,, uint64 closedAt,,,,,,) = vault.promises(id);
+        assertEq(endBlock, vm.getBlockNumber(), "the window ends at the closing block");
         assertGe(endBlock, startBlock, "the window never ends before it starts");
         assertEq(closedAt, vm.getBlockTimestamp());
+        assertEq(attempts, 0);
+    }
+
+    function close(uint256 seed, uint8 whoRaw) external steps {
+        uint256 id = _pick(seed);
+        if (id == 0) return;
+        if (_status(id) != PinkyVaultV2.Status.Active) {
+            vm.expectRevert(PinkyVaultV2.WrongStatus.selector);
+            vault.close(id);
+            return;
+        }
+        _close(id, _who(id, whoRaw), false);
     }
 
     /// @dev Whether the current Intake can be paid for this promise, and what it costs.
     function _quote(uint256 id) internal view returns (bool payable_, uint256 price, bool same) {
         MockIntake cur = _current();
         price = cur.price();
-        (uint256 maxPrice,,, address madeUnder, bytes32 action) = vault.terms(id);
+        (uint256 maxPrice,,, address madeUnder, bytes32 action,) = vault.terms(id);
         same = address(cur) == madeUnder && action == vault.action();
         payable_ = !(price == 0 || price > _bond(id) || (!same && price > maxPrice));
     }
 
-    function settle(uint256 seed, bool asMaker) external steps {
-        uint256 id = _pick(seed);
-        if (id == 0 || _status(id) != PinkyVaultV2.Status.Active) return;
-        _ripen(id);
-        address who = asMaker ? _maker(id) : watcher;
-        (bool payable_, uint256 price,) = _quote(id);
-        if (!payable_) {
-            uint256 held = imd.balanceOf(address(vault));
-            vm.prank(who);
-            vm.expectRevert(PinkyVaultV2.InvalidPayment.selector);
-            vault.settle(id);
-            assertEq(imd.balanceOf(address(vault)), held);
-            assertEq(uint8(_status(id)), uint8(PinkyVaultV2.Status.Active), "a settle that cannot pay closes nothing");
-            return;
-        }
-        vm.prank(who);
-        bytes32 requestId = vault.settle(id);
-        _recordAsk(id, who, price, requestId, address(0));
-        (,,,,,,,,,,, uint64 endBlock,,,,,,,,) = vault.promises(id);
-        assertEq(endBlock, vm.getBlockNumber() - vault.SETTLE_DELAY_BLOCKS());
-    }
-
-    function ask(uint256 seed) external steps {
-        _ask(seed, watcher);
-    }
-
-    function askAsMaker(uint256 seed) external steps {
+    /// @dev `settle` closes an active promise, asks for a closed one, and refuses the rest.
+    function settle(uint256 seed, uint8 whoRaw) external steps {
         uint256 id = _pick(seed);
         if (id == 0) return;
-        _ask(seed, _maker(id));
-    }
-
-    function _ask(uint256 seed, address who) internal {
-        uint256 id = _pick(seed);
-        if (id == 0) return;
+        address who = _who(id, whoRaw);
         PinkyVaultV2.Status s = _status(id);
-        if (s != PinkyVaultV2.Status.Closed && s != PinkyVaultV2.Status.Asked) return;
-        (,,,, uint8 attempts,,,,,,,,,, uint64 askedAt,,,,, bool failed) = vault.promises(id);
-        if (s == PinkyVaultV2.Status.Asked && !failed && vm.getBlockTimestamp() < askedAt + vault.ANSWER_TIMEOUT()) {
+        if (s == PinkyVaultV2.Status.Active) {
+            _close(id, who, true);
+        } else if (s == PinkyVaultV2.Status.Closed) {
+            _ask(id, who, true);
+        } else {
             vm.prank(who);
-            vm.expectRevert(PinkyVaultV2.TooEarly.selector);
+            vm.expectRevert(PinkyVaultV2.WrongStatus.selector);
+            vault.settle(id);
+        }
+    }
+
+    function ask(uint256 seed, uint8 whoRaw) external steps {
+        uint256 id = _pick(seed);
+        if (id == 0) return;
+        address who = _who(id, whoRaw);
+        PinkyVaultV2.Status s = _status(id);
+        if (s != PinkyVaultV2.Status.Closed && s != PinkyVaultV2.Status.Asked) {
+            vm.prank(who);
+            vm.expectRevert(PinkyVaultV2.WrongStatus.selector);
             vault.ask(id);
             return;
+        }
+        _ask(id, who, false);
+    }
+
+    /// @dev Asks as `who`, through `settle` (closed only) or `ask`. Every refusal the vault owes
+    /// is probed first, in the order the vault checks them, and spends nothing.
+    function _ask(uint256 id, address who, bool viaSettle) internal {
+        PinkyVaultV2.Status s = _status(id);
+        (
+            ,,,,
+            uint8 attempts,,,,
+            address beneficiary,,,
+            uint64 endBlock,,
+            uint64 closedAt,
+            uint64 askedAt,,,,,
+            bool failed
+        ) = vault.promises(id);
+        uint256 held = imd.balanceOf(address(vault));
+        if (s == PinkyVaultV2.Status.Asked && !failed && vm.getBlockTimestamp() < askedAt + vault.ANSWER_TIMEOUT()) {
+            _refuse(id, who, viaSettle, PinkyVaultV2.TooEarly.selector);
+            return;
+        }
+        uint256 deep = uint256(endBlock) + vault.SETTLE_DELAY_BLOCKS();
+        if (vm.getBlockNumber() < deep) {
+            _refuse(id, who, viaSettle, PinkyVaultV2.TooEarly.selector);
+            vm.roll(deep);
         }
         if (attempts >= vault.MAX_ATTEMPTS()) {
-            vm.prank(who);
-            vm.expectRevert(PinkyVaultV2.NoAttemptsLeft.selector);
-            vault.ask(id);
+            _refuse(id, who, viaSettle, PinkyVaultV2.NoAttemptsLeft.selector);
+            return;
+        }
+        if (vm.getBlockTimestamp() >= closedAt + vault.REFUND_GRACE() && who != _maker(id) && who != beneficiary) {
+            _refuse(id, who, viaSettle, PinkyVaultV2.NotAParty.selector);
             return;
         }
         (bool payable_, uint256 price,) = _quote(id);
         if (!payable_) {
-            uint256 held = imd.balanceOf(address(vault));
-            vm.prank(who);
-            vm.expectRevert(PinkyVaultV2.InvalidPayment.selector);
-            vault.ask(id);
-            assertEq(imd.balanceOf(address(vault)), held);
+            _refuse(id, who, viaSettle, PinkyVaultV2.InvalidPayment.selector);
             return;
         }
+        assertEq(imd.balanceOf(address(vault)), held);
         address askerBefore = _asker(id);
         vm.prank(who);
-        bytes32 requestId = vault.ask(id);
+        bytes32 requestId = viaSettle ? vault.settle(id) : vault.ask(id);
         _recordAsk(id, who, price, requestId, askerBefore);
+    }
+
+    function _refuse(uint256 id, address who, bool viaSettle, bytes4 err) internal {
+        uint256 held = imd.balanceOf(address(vault));
+        uint8 attempts = lastAttempts[id];
+        PinkyVaultV2.Status s = _status(id);
+        vm.prank(who);
+        vm.expectRevert(err);
+        if (viaSettle) vault.settle(id);
+        else vault.ask(id);
+        assertEq(imd.balanceOf(address(vault)), held, "a refused ask spends nothing");
+        assertEq(uint8(_status(id)), uint8(s));
+        (,,,, uint8 after_,,,,,,,,,,,,,,,) = vault.promises(id);
+        assertEq(after_, attempts);
     }
 
     function _recordAsk(uint256 id, address who, uint256 price, bytes32 requestId, address askerBefore) internal {
@@ -387,8 +443,10 @@ contract PinkyV2Handler is Test {
         } else {
             assertEq(askerAfter, askerBefore, "a re-ask never replaces a watcher");
         }
-        (, uint16 panel, uint16 quorum,,) = vault.terms(id);
+        (, uint16 panel, uint16 quorum,,,) = vault.terms(id);
         assertLe(panel, vault.panelSize(), "the terms keep the smallest panel paid for");
+        (,,,,, address boughtUnder) = vault.terms(id);
+        assertEq(boughtUnder, vault.oracleSigner(), "a request is bought under the key current at its ask");
         assertLe(quorum, vault.quorum());
         assertGe(panel, 2);
         assertGe(quorum, 2);
@@ -426,7 +484,7 @@ contract PinkyV2Handler is Test {
         a.toBlock = endBlock;
         a.blockHash = keccak256("b");
         a.panelJobId = keccak256("p");
-        (, uint16 panel, uint16 quorum,,) = vault.terms(id);
+        (, uint16 panel, uint16 quorum,,,) = vault.terms(id);
         a.panelSize = panel;
         a.quorum = quorum;
         a.agreed = panel;
@@ -434,15 +492,45 @@ contract PinkyV2Handler is Test {
         a.expiresAt = uint64(vm.getBlockTimestamp() + vault.validForSeconds());
     }
 
-    function _sign(OracleAttestation.Attestation memory a) internal view returns (bytes memory) {
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(SIGNER_PK, vault.attestationDigest(a));
+    function _sign(OracleAttestation.Attestation memory a, uint256 pk) internal view returns (bytes memory) {
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, vault.attestationDigest(a));
         return abi.encodePacked(r, s, v);
     }
 
     /// @dev The oracle answers one of the promise's live requests, not always the latest.
-    function answer(uint256 seed, uint256 reqSeed, uint256 out) external steps {
+    function answer(uint256 seed, uint256 reqSeed, uint256 out, bool byCurrent) external steps {
         uint256 id = _pick(seed);
         if (id == 0 || _status(id) != PinkyVaultV2.Status.Asked) return;
+        _answer(id, reqSeed, out, byCurrent);
+    }
+
+    /// @dev Takes one promise as far as it will go in one action: closed, asked, answered and paid
+    /// out, each step by the same rules as the separate actions. Without it, random sequences
+    /// spread over many promises rarely carry one to a payout.
+    function advance(uint256 seed, uint8 whoRaw, uint256 out, bool byCurrent) external steps {
+        uint256 id = _pick(seed);
+        if (id == 0) return;
+        address who = _who(id, whoRaw);
+        for (uint256 i; i < 4; ++i) {
+            PinkyVaultV2.Status s = _status(id);
+            if (s == PinkyVaultV2.Status.Active) {
+                _close(id, who, false);
+            } else if (s == PinkyVaultV2.Status.Closed) {
+                _ask(id, who, true);
+            } else if (s == PinkyVaultV2.Status.Asked) {
+                _answer(id, out, out, byCurrent);
+            } else {
+                (,,,,, bool paid,,,,,,,,,,,,,,) = vault.promises(id);
+                if (!paid && s != PinkyVaultV2.Status.Refunded) _payout(id);
+                return;
+            }
+            if (_status(id) == s) return;
+            // Each step is checked as its own action would be.
+            _track();
+        }
+    }
+
+    function _answer(uint256 id, uint256 reqSeed, uint256 out, bool byCurrent) internal {
         (Req memory r, bool found) = _liveRequest(id, reqSeed);
         if (!found) return;
         assertEq(vault.promiseIdFor(r.intake, r.id), id, "a live request is still the promise's");
@@ -450,7 +538,12 @@ contract PinkyV2Handler is Test {
         out = bound(out, 0, amount + 1);
         (OracleAttestation.Attestation memory a, bool kept) = _attest(id, out);
         uint256 held = imd.balanceOf(address(vault));
-        bytes memory sig = _sign(a);
+        // The key the latest ask was bought under and the current key are both taken; no other is.
+        (,,,,, address boughtUnder) = vault.terms(id);
+        bytes memory stranger = _sign(a, 0xBAD);
+        vm.expectRevert(OracleAttestationConsumer.BadSignature.selector);
+        MockIntake(r.intake).complete(r.id, a, stranger);
+        bytes memory sig = _sign(a, keyOf[byCurrent ? vault.oracleSigner() : boughtUnder]);
         MockIntake(r.intake).complete(r.id, a, sig);
         verdicts += 1;
         assertEq(imd.balanceOf(address(vault)), held, "a verdict moves no funds");
@@ -489,6 +582,10 @@ contract PinkyV2Handler is Test {
     function payout(uint256 seed) external steps {
         uint256 id = _pick(seed);
         if (id == 0) return;
+        _payout(id);
+    }
+
+    function _payout(uint256 id) internal {
         PinkyVaultV2.Status s = _status(id);
         (address maker,,,,, bool paid,,, address beneficiary, uint256 bond,,,,,, address asker,,,,) = vault.promises(id);
         if (paid || (s != PinkyVaultV2.Status.Kept && s != PinkyVaultV2.Status.Broken)) {
