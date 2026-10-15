@@ -72,7 +72,7 @@ manifest is `launch.json` (the first launch's is kept in `launches/1166-launch.j
 | Four kinds | **Keep**: no more than N of a token out (the first vault's promise). **Pay**: at least N of a token sent to a named address (log-sum filtered on `from` and `to`, tested live on 2026-10-14). **Hold**: at least N held at the closing block (`call-compare` on `balanceOf`, so NFTs and staked balances too; checked once, at the end). **Moves**: no more than N transfers out (`log-count`, for NFTs) |
 | A beneficiary | A promise can be made to someone. Broken, the bond goes to them, less 1% |
 | A fee | 1% of every bond that goes home or to a beneficiary, sent to PinkyStaking. None on the public split or a refund |
-| One call to settle | `settle(id)` closes the window 32 blocks behind the head and asks at once, two minutes after the deadline |
+| Two calls to settle | `settle(id)` ends the term at the current block (the maker from the deadline, anyone else two minutes later) and, called again 32 blocks later, buys the oracle's answer. `close(id)` and `ask(id)` are the same two steps by name |
 | Intake v2 | Asks with `requestWithFailure`: a refusal or a panel that did not agree is reported at once. The report is unsigned, moves no funds and only lets anyone ask again without the day's wait |
 | Slow settings | The owner can only propose a new Intake, signer, panel or fee sink; anyone applies it seven days later |
 
@@ -86,12 +86,24 @@ and the fee sink start from the constructor and change only through a seven-day 
 
 The second vault's own limits, beside those under "Trust and known limits":
 
-- **The window needs 32 blocks.** `close` and `settle` refuse (`TooEarly`) until the chain has
-  minted 32 blocks since `make`, because the window ends 32 blocks behind the head. Robinhood
-  Chain mints a block every few hundred milliseconds while there are transactions, so a term of
-  ten minutes or more has them; on a quiet chain every refused call mints one. The 32 blocks before
-  `close` are never in the window, which is why `close` waits two minutes after the deadline: close
-  promptly, once 32 blocks have followed the deadline, so the blocks left out are after it.
+- **The window ends at the closing block, and the ask waits 32 blocks.** The window runs from
+  the block of `make` to the block of `close` (or the first `settle`), as in the first vault, so
+  it covers every block of the term however few the chain minted: Robinhood Chain mints a block
+  only when a transaction arrives, so nothing earlier than the closing block is known to lie past
+  the deadline. The oracle wants that block confirmed, so `ask` (or the second `settle`) refuses
+  with `TooEarly` until 32 more blocks exist; on a quiet chain every refused call mints one.
+- **Close on time.** Whatever the wallet does between the deadline and the close is judged too,
+  and nobody has to close. The maker may close from the deadline itself; anyone else two minutes
+  later. A maker who closes at the deadline is judged on the term alone and nobody can stretch the
+  window first; one who waits is judged until someone else closes.
+- **Asking again.** Anyone may ask again after a day, or at once after a failure report, three
+  times in all, each time from the bond. Once the bond could be refunded (seven days after the
+  close), only the maker or the beneficiary may ask again, so a stranger cannot push the refund
+  back a day at a time.
+- **The bounty.** The 10% of a broken, beneficiary-less bond goes to the first asker unless that
+  is the maker's own address. No contract rule can tell a maker's second wallet from a watcher,
+  so read the sure penalty as 90% of the remaining bond and the bounty as a rebate to whoever asks
+  first, as for the first vault.
 - **Hold and Moves are untested live.** Only the `log-sum` recipe (Keep, Pay) has a recorded
   oracle answer (`requests/oracle-test2.body.json`, 2026-10-14). The `call-compare` recipe (Hold)
   and the `log-count` recipe (Moves) have not been bought from the live oracle. If the oracle
@@ -102,10 +114,13 @@ The second vault's own limits, beside those under "Trust and known limits":
 - **A proposal applies to open promises.** A signer or Intake proposed today takes effect in
   seven days, inside the term of any promise then open (terms run up to 30 days, and a maker
   cannot leave early). The owner, with a signer of their own, could then sign any verdict for
-  those promises; with an Intake of their own, route up to three fees per promise, never more per
-  request than the price at `make`. Every pending request signed by the old signer is refused
-  after the change and costs that promise one ask. This is the owner role the brief asks for,
-  held by the wallet above.
+  those promises, and decide the verdict of every promise then open; with an Intake of their own,
+  route up to three fees per promise, never more per request than the price at `make`. The
+  proposal is a public event and the seven days are the notice; there is no early exit. A request
+  bought before a signer change stays answerable by the signer it was bought under (recorded in
+  `terms(id)` at each ask), so a rotation costs no promise its fee. This is the owner role the
+  brief asks for, held by the wallet above. An Intake proposal is refused up front if the address
+  has no code.
 
 ## Where IMD is used
 

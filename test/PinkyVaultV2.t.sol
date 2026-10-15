@@ -64,8 +64,17 @@ contract PinkyVaultV2Test is Test {
         vm.roll(vm.getBlockNumber() + 37_200);
     }
 
+    /// @dev The 32 blocks the oracle wants behind the closing block.
+    function _confirmed() internal {
+        vm.roll(vm.getBlockNumber() + 32);
+    }
+
+    /// @dev The watcher's two calls: one closes at the head, the next asks 32 blocks later.
     function _settle(uint256 id) internal returns (bytes32 requestId) {
         _due();
+        vm.prank(watcher);
+        assertEq(vault.settle(id), bytes32(0));
+        _confirmed();
         vm.prank(watcher);
         requestId = vault.settle(id);
     }
@@ -204,65 +213,125 @@ contract PinkyVaultV2Test is Test {
 
     // ───────────────────────── settle ─────────────────────────
 
-    function test_SettleClosesThirtyTwoBlocksBackAndAsksAtOnce() public {
+    function test_SettleClosesAtTheHeadAndAsksThirtyTwoBlocksLater() public {
         uint256 id = _keep();
-        bytes32 requestId = _settle(id);
+        _due();
+        vm.prank(watcher);
+        assertEq(vault.settle(id), bytes32(0));
         (uint64 startBlock, uint64 endBlock) = _window(id);
         assertEq(startBlock, 1_000);
-        assertEq(endBlock, vm.getBlockNumber() - 32);
+        assertEq(endBlock, vm.getBlockNumber());
+        assertEq(uint8(_status(id)), uint8(PinkyVaultV2.Status.Closed));
+        assertEq(_bond(id), BOND);
+        // The oracle wants the closing block confirmed: 32 blocks, not 31.
+        vm.roll(vm.getBlockNumber() + 31);
+        vm.prank(watcher);
+        vm.expectRevert(PinkyVaultV2.TooEarly.selector);
+        vault.settle(id);
+        vm.roll(vm.getBlockNumber() + 1);
+        vm.prank(watcher);
+        bytes32 requestId = vault.settle(id);
+        assertTrue(requestId != bytes32(0));
         assertEq(uint8(_status(id)), uint8(PinkyVaultV2.Status.Asked));
         assertEq(_bond(id), BOND - PRICE);
         assertEq(imd.balanceOf(payee), PRICE);
         assertEq(vault.promiseIdFor(address(intake), requestId), id);
+        // Settling an asked promise is `ask`'s business, with its own wait.
+        vm.expectRevert(PinkyVaultV2.WrongStatus.selector);
+        vault.settle(id);
     }
 
-    function test_SettleWaitsForTheGrace() public {
+    /// On a chain that mints a block only when a transaction arrives, fewer than 32 blocks can
+    /// follow a transfer made inside the term before the close. The window ends at the closing
+    /// block, so the transfer is in it whatever the chain did in between.
+    function test_TheWindowCoversTheWholeTermOnAQuietChain() public {
         uint256 id = _keep();
-        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        uint64 deadline = uint64(vm.getBlockTimestamp() + 1 hours);
+        vm.roll(1_010);
+        vm.warp(deadline - 30 minutes);
+        vm.prank(maker);
+        token.mint(maker, AMOUNT + 1);
+        vm.prank(maker);
+        token.transfer(friend, AMOUNT + 1);
+        // Only 31 more blocks by the time the term can be closed.
+        vm.roll(1_041);
+        vm.warp(deadline + vault.CLOSE_GRACE());
+        vm.prank(watcher);
+        vault.close(id);
+        (uint64 startBlock, uint64 endBlock) = _window(id);
+        assertEq(startBlock, 1_000);
+        assertEq(endBlock, 1_041);
+        // And the ask waits for the 32 blocks after it, each refused call minting one.
+        vm.roll(1_072);
+        vm.prank(watcher);
+        vm.expectRevert(PinkyVaultV2.TooEarly.selector);
+        vault.ask(id);
+        vm.roll(1_073);
+        vm.prank(watcher);
+        bytes32 requestId = vault.ask(id);
+        string memory body = string(intake.bodyOf(requestId));
+        assertEq(vm.parseJsonUint(body, ".window.fromBlock"), 1_000);
+        assertEq(vm.parseJsonUint(body, ".window.toBlock"), 1_041);
+    }
+
+    /// A term with fewer than 32 blocks in it closes like any other: the window is [make, close].
+    function test_AShortQuietTermStillClosesAtTheHead() public {
+        uint256 id = _keep();
+        vm.warp(vm.getBlockTimestamp() + 1 hours + vault.CLOSE_GRACE());
+        vm.roll(1_005);
+        vault.close(id);
+        (uint64 startBlock, uint64 endBlock) = _window(id);
+        assertEq(startBlock, 1_000);
+        assertEq(endBlock, 1_005);
+    }
+
+    function test_TheMakerMayCloseAtTheDeadlineAndOthersAfterTheGrace() public {
+        uint256 id = _keep();
+        uint256 deadline = vm.getBlockTimestamp() + 1 hours;
+        vm.warp(deadline - 1);
         vm.roll(vm.getBlockNumber() + 36_000);
+        vm.prank(maker);
+        vm.expectRevert(PinkyVaultV2.TooEarly.selector);
+        vault.close(id);
+        vm.warp(deadline);
+        vm.prank(watcher);
         vm.expectRevert(PinkyVaultV2.TooEarly.selector);
         vault.settle(id);
-        vm.warp(vm.getBlockTimestamp() + vault.CLOSE_GRACE() - 1);
+        vm.prank(friend);
+        vm.expectRevert(PinkyVaultV2.TooEarly.selector);
+        vault.close(id);
+        vm.warp(deadline + vault.CLOSE_GRACE() - 1);
+        vm.prank(watcher);
         vm.expectRevert(PinkyVaultV2.TooEarly.selector);
         vault.settle(id);
-        vm.warp(vm.getBlockTimestamp() + 1);
+        vm.warp(deadline + vault.CLOSE_GRACE());
+        vm.prank(watcher);
         vault.settle(id);
+        assertEq(uint8(_status(id)), uint8(PinkyVaultV2.Status.Closed));
+
+        uint256 other = _keep();
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        vm.prank(maker);
+        vault.settle(other);
+        (, uint64 endBlock) = _window(other);
+        assertEq(endBlock, vm.getBlockNumber());
+        assertEq(uint8(_status(other)), uint8(PinkyVaultV2.Status.Closed));
     }
 
     function test_SettleUsesTheArbitrumBlockNumber() public {
         vm.mockCall(address(100), abi.encodeWithSignature("arbBlockNumber()"), abi.encode(uint256(84_000_000)));
         uint256 id = _keep();
         vm.mockCall(address(100), abi.encodeWithSignature("arbBlockNumber()"), abi.encode(uint256(84_040_000)));
-        _settle(id);
+        _due();
+        vault.settle(id);
         (uint64 startBlock, uint64 endBlock) = _window(id);
         assertEq(startBlock, 84_000_000);
-        assertEq(endBlock, 84_039_968);
-    }
-
-    /// A quiet chain can have fewer than 32 blocks since `make` when the term ends. Closing then
-    /// would record the one-block window [startBlock, startBlock] and judge the whole term on
-    /// nothing: `close` refuses until the blocks exist, as `settle` already did.
-    function test_CloseRefusesUntilThirtyTwoBlocksExistBehindTheHead() public {
-        uint256 id = _keep();
-        vm.warp(vm.getBlockTimestamp() + 1 hours + vault.CLOSE_GRACE());
-        // 20 blocks since make: the window would collapse to its start.
-        vm.roll(1_020);
-        vm.expectRevert(PinkyVaultV2.TooEarly.selector);
-        vault.close(id);
+        assertEq(endBlock, 84_040_000);
+        vm.mockCall(address(100), abi.encodeWithSignature("arbBlockNumber()"), abi.encode(uint256(84_040_031)));
         vm.expectRevert(PinkyVaultV2.TooEarly.selector);
         vault.settle(id);
-        assertEq(uint8(_status(id)), uint8(PinkyVaultV2.Status.Active));
-        vm.roll(1_031);
-        vm.expectRevert(PinkyVaultV2.TooEarly.selector);
-        vault.close(id);
-        // Exactly 32 blocks behind the head: the earliest the window can end, at its own start.
-        vm.roll(1_032);
-        vault.close(id);
-        (uint64 startBlock, uint64 endBlock) = _window(id);
-        assertEq(startBlock, 1_000);
-        assertEq(endBlock, 1_000);
-        vm.prank(watcher);
-        vault.ask(id);
+        vm.mockCall(address(100), abi.encodeWithSignature("arbBlockNumber()"), abi.encode(uint256(84_040_032)));
+        vault.settle(id);
         assertEq(uint8(_status(id)), uint8(PinkyVaultV2.Status.Asked));
     }
 
@@ -271,6 +340,10 @@ contract PinkyVaultV2Test is Test {
         _due();
         vault.close(id);
         assertEq(uint8(_status(id)), uint8(PinkyVaultV2.Status.Closed));
+        vm.prank(watcher);
+        vm.expectRevert(PinkyVaultV2.TooEarly.selector);
+        vault.ask(id);
+        _confirmed();
         vm.prank(watcher);
         vault.ask(id);
         assertEq(uint8(_status(id)), uint8(PinkyVaultV2.Status.Asked));
@@ -373,6 +446,10 @@ contract PinkyVaultV2Test is Test {
         uint256 b = _keep();
         uint256 c = _make(PinkyVaultV2.Kind.Moves, address(0), address(0));
         _due();
+        vault.close(a);
+        vault.close(b);
+        vault.close(c);
+        _confirmed();
         bytes32 ra = vault.settle(a);
         bytes32 rb = vault.settle(b);
         bytes32 rc = vault.settle(c);
@@ -388,6 +465,9 @@ contract PinkyVaultV2Test is Test {
         uint256 a = _make(PinkyVaultV2.Kind.Pay, friend, friend);
         uint256 b = _make(PinkyVaultV2.Kind.Pay, friend, friend);
         _due();
+        vault.close(a);
+        vault.close(b);
+        _confirmed();
         bytes32 ra = vault.settle(a);
         bytes32 rb = vault.settle(b);
         _answerUint(a, ra, AMOUNT);
@@ -400,6 +480,9 @@ contract PinkyVaultV2Test is Test {
         uint256 a = _make(PinkyVaultV2.Kind.Hold, address(0), address(0));
         uint256 b = _make(PinkyVaultV2.Kind.Hold, address(0), address(0));
         _due();
+        vault.close(a);
+        vault.close(b);
+        _confirmed();
         bytes32 ra = vault.settle(a);
         bytes32 rb = vault.settle(b);
         _answerBool(a, ra, true, 2_000 ether);
@@ -414,6 +497,9 @@ contract PinkyVaultV2Test is Test {
         uint256 hold = _make(PinkyVaultV2.Kind.Hold, address(0), address(0));
         uint256 keep = _keep();
         _due();
+        vault.close(hold);
+        vault.close(keep);
+        _confirmed();
         bytes32 rh = vault.settle(hold);
         bytes32 rk = vault.settle(keep);
         OracleAttestation.Attestation memory a = _attestation(hold, 3, abi.encode(uint256(1)), 1);
@@ -512,6 +598,9 @@ contract PinkyVaultV2Test is Test {
     function test_MakerWhoAsksEarnsNoBounty() public {
         uint256 id = _keep();
         _due();
+        vm.prank(maker);
+        vault.settle(id);
+        _confirmed();
         vm.prank(maker);
         bytes32 requestId = vault.settle(id);
         _answerUint(id, requestId, AMOUNT + 1);
@@ -732,8 +821,104 @@ contract PinkyVaultV2Test is Test {
         vm.warp(vm.getBlockTimestamp() + 7 days);
         vault.enact(PinkyVaultV2.Setting.Protocol);
         vm.roll(vm.getBlockNumber() + 40_000);
+        vault.close(id);
+        _confirmed();
         vm.expectRevert(PinkyVaultV2.InvalidPayment.selector);
         vault.settle(id);
+    }
+
+    function test_ProposeProtocolRefusesAnIntakeWithoutCode() public {
+        vm.prank(owner);
+        vm.expectRevert(PinkyVaultV2.InvalidConfiguration.selector);
+        vault.proposeProtocol(makeAddr("not a contract"), ACTION);
+        (,, uint64 eta) = vault.pending(PinkyVaultV2.Setting.Protocol);
+        assertEq(eta, 0);
+    }
+
+    /// A request bought under one signer is answerable by that signer after a rotation, so a
+    /// proposal enacted a moment after an ask does not cost the promise its fee and a day.
+    function test_ARequestBoughtUnderTheOldSignerSurvivesARotation() public {
+        uint256 nextPk = 0xB0B;
+        vm.prank(owner);
+        vault.proposeSigner(vm.addr(nextPk));
+        uint256 id = _keep();
+        uint256 other = _keep();
+        vm.warp(vm.getBlockTimestamp() + 10 days);
+        vm.roll(vm.getBlockNumber() + 40_000);
+        vault.close(id);
+        vault.close(other);
+        _confirmed();
+        vm.prank(watcher);
+        bytes32 requestId = vault.settle(id);
+        (,,,,, address boughtUnder) = vault.terms(id);
+        assertEq(boughtUnder, signer);
+        vault.enact(PinkyVaultV2.Setting.Signer);
+        assertEq(vault.oracleSigner(), vm.addr(nextPk));
+        // A stranger's key is still refused, and so is a stale attestation.
+        OracleAttestation.Attestation memory a = _attestation(id, 3, abi.encode(uint256(0)), 0);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(0xC0FFEE, vault.attestationDigest(a));
+        vm.expectRevert(OracleAttestationConsumer.BadSignature.selector);
+        intake.complete(requestId, a, abi.encodePacked(r, s, v));
+        a.expiresAt = uint64(vm.getBlockTimestamp() - 1);
+        bytes memory sig = _sign(a);
+        vm.expectRevert(abi.encodeWithSelector(OracleAttestationConsumer.AttestationExpired.selector, a.expiresAt));
+        intake.complete(requestId, a, sig);
+        // The key the request was bought under is accepted.
+        a = _attestation(id, 3, abi.encode(uint256(0)), 0);
+        intake.complete(requestId, a, _sign(a));
+        assertEq(uint8(_status(id)), uint8(PinkyVaultV2.Status.Kept));
+        // A request bought after the rotation is held to the new key, and the old one no longer counts.
+        vm.prank(watcher);
+        bytes32 later = vault.settle(other);
+        a = _attestation(other, 3, abi.encode(uint256(0)), 0);
+        sig = _sign(a);
+        vm.expectRevert(OracleAttestationConsumer.BadSignature.selector);
+        intake.complete(later, a, sig);
+        (v, r, s) = vm.sign(nextPk, vault.attestationDigest(a));
+        intake.complete(later, a, abi.encodePacked(r, s, v));
+        assertEq(uint8(_status(other)), uint8(PinkyVaultV2.Status.Kept));
+    }
+
+    /// Once the bond could be refunded, a stranger can no longer spend it on another ask in the
+    /// refund's own block; the maker and the beneficiary still can.
+    function test_OnlyThePartiesMayAskOnceTheRefundIsDue() public {
+        uint256 id = _make(PinkyVaultV2.Kind.Keep, address(0), friend);
+        _due();
+        vault.close(id);
+        _confirmed();
+        vm.warp(vm.getBlockTimestamp() + vault.REFUND_GRACE());
+        vm.prank(watcher);
+        vm.expectRevert(PinkyVaultV2.NotAParty.selector);
+        vault.ask(id);
+        vm.prank(watcher);
+        vm.expectRevert(PinkyVaultV2.NotAParty.selector);
+        vault.settle(id);
+        vm.prank(friend);
+        vault.ask(id);
+        assertEq(_bond(id), BOND - PRICE);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        vm.prank(watcher);
+        vm.expectRevert(PinkyVaultV2.NotAParty.selector);
+        vault.ask(id);
+        vm.prank(maker);
+        vault.ask(id);
+        assertEq(_bond(id), BOND - 2 * PRICE);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        uint256 before = imd.balanceOf(maker);
+        vault.refund(id);
+        assertEq(imd.balanceOf(maker) - before, BOND - 2 * PRICE);
+    }
+
+    /// Before the refund is due, asking stays open to anyone, as before.
+    function test_AnyoneMayAskBeforeTheRefundIsDue() public {
+        uint256 id = _keep();
+        _due();
+        vault.close(id);
+        _confirmed();
+        vm.warp(vm.getBlockTimestamp() + vault.REFUND_GRACE() - 1);
+        vm.prank(watcher);
+        vault.ask(id);
+        assertEq(uint8(_status(id)), uint8(PinkyVaultV2.Status.Asked));
     }
 
     // ───────────────────────── the Intake's gas ─────────────────────────
@@ -747,6 +932,10 @@ contract PinkyVaultV2Test is Test {
             _make(PinkyVaultV2.Kind.Moves, address(0), address(0))
         ];
         _due();
+        for (uint256 i; i < 4; i++) {
+            vault.close(ids[i]);
+        }
+        _confirmed();
         for (uint256 i; i < 4; i++) {
             bytes32 requestId = vault.settle(ids[i]);
             OracleAttestation.Attestation memory a = i == 2

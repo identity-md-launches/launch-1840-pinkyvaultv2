@@ -5,6 +5,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
+import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import {OracleAttestation, OracleAttestationConsumer} from "./OracleAttestation.sol";
 import {IIntakeV2} from "./interfaces/IIntakeV2.sol";
 
@@ -30,6 +31,9 @@ interface IStakingPool {
 ///           NFTs included. Checked once, at the end: what happens in between is not seen.
 ///  - Moves: the wallet will make no more than `amount` transfers of `token` out (log-count,
 ///           from = maker). Meant for NFTs, where one transfer is one token.
+///
+/// The window runs from the block of `make` to the block of `close`, which the maker may call at
+/// the deadline and anyone two minutes later; the oracle is asked 32 blocks after that.
 ///
 /// A kept promise returns the bond to the maker less a 1% fee. A broken promise made to a
 /// beneficiary pays the beneficiary the bond less the same fee; one made to nobody is split as in
@@ -91,13 +95,15 @@ contract PinkyVaultV2 is OracleAttestationConsumer, ReentrancyGuard {
     }
 
     /// @dev What a promise was bought under, as in the first vault: the Intake, action and price
-    /// seen at `make`, and the smallest panel any of its requests paid for.
+    /// seen at `make`, the smallest panel any of its requests paid for, and the signer at its
+    /// latest `ask`, whose answer stays acceptable if the owner rotates the signer meanwhile.
     struct Terms {
         uint256 maxPrice;
         uint16 panelSize;
         uint16 quorum;
         address intake;
         bytes32 action;
+        address signer;
     }
 
     /// @dev A setting change waiting out its delay. `eta` zero: nothing pending.
@@ -121,6 +127,7 @@ contract PinkyVaultV2 is OracleAttestationConsumer, ReentrancyGuard {
     error InvalidAttestation();
     error AlreadyPaid();
     error NothingPending();
+    error NotAParty();
 
     event Made(
         uint256 indexed id,
@@ -167,11 +174,13 @@ contract PinkyVaultV2 is OracleAttestationConsumer, ReentrancyGuard {
 
     uint256 public constant MIN_DURATION = 10 minutes;
     uint256 public constant MAX_DURATION = 30 days;
-    /// @dev The oracle wants a closing block at least five behind the head. `close` puts the end of
-    /// the window this many blocks back, so the question can be asked in the same transaction.
+    /// @dev The window ends at the block that closes it, so it covers every block of the term on
+    /// any chain, one that mints a block only when a transaction arrives included. The oracle wants
+    /// that closing block confirmed, so the ask waits this many blocks after it, as in the first
+    /// vault. On Robinhood Chain that is a few seconds while there are transactions.
     uint256 public constant SETTLE_DELAY_BLOCKS = 32;
-    /// @dev And it may only do so this long after the deadline, so the blocks it leaves out lie
-    /// after the deadline. On Robinhood Chain 32 blocks take a few seconds.
+    /// @dev The maker may close from the deadline itself; anyone else this much later. A maker who
+    /// closes on time is judged on the term alone, and nobody else can stretch the window first.
     uint256 public constant CLOSE_GRACE = 2 minutes;
     uint256 public constant ANSWER_TIMEOUT = 1 days;
     uint256 public constant REFUND_GRACE = 7 days;
@@ -290,14 +299,22 @@ contract PinkyVaultV2 is OracleAttestationConsumer, ReentrancyGuard {
         emit Made(id, msg.sender, token, kind, amount, target, beneficiary, bond, v.startBlock, v.endTime);
     }
 
-    /// @notice Ends the term and asks the oracle, in one call. Anyone may call once it is due.
+    /// @notice Ends the term when it is still running, and asks the oracle once it has ended.
+    /// Anyone may call: the maker from the deadline, anyone else two minutes later. The window
+    /// ends at the block that closes it, and the oracle wants that block confirmed, so the ask is a
+    /// second call 32 blocks later; a call that only closed returns zero.
     function settle(uint256 id) external nonReentrant returns (bytes32 requestId) {
-        _close(id);
+        Promise storage v = _promise(id);
+        if (v.status == Status.Active) {
+            _close(id);
+            return 0;
+        }
+        if (v.status != Status.Closed) revert WrongStatus();
         requestId = _ask(id);
     }
 
-    /// @notice Ends the term without asking. For when the oracle cannot be asked right now; the
-    /// bond can then be refunded after the grace period if nobody asks.
+    /// @notice Ends the term and fixes the block the window ends at. The bond can be refunded after
+    /// the grace period if nobody asks.
     function close(uint256 id) external nonReentrant {
         _close(id);
     }
@@ -306,7 +323,7 @@ contract PinkyVaultV2 is OracleAttestationConsumer, ReentrancyGuard {
     /// for a day.
     /// @dev Every request this promise paid for stays answerable until a verdict lands or the Intake
     /// reports it failed. The asker is whoever asked first, unless that was the maker, who earns no
-    /// bounty.
+    /// bounty. Once the bond could be refunded, only the maker or the beneficiary may ask again.
     function ask(uint256 id) external nonReentrant returns (bytes32 requestId) {
         Promise storage v = _promise(id);
         if (v.status == Status.Asked) {
@@ -326,8 +343,8 @@ contract PinkyVaultV2 is OracleAttestationConsumer, ReentrancyGuard {
         if (id == 0) revert UnknownRequest();
         Promise storage v = promises[id];
         if (v.status != Status.Asked) revert WrongStatus();
-        _verifyAttestation(a, signature);
         Terms storage t = terms[id];
+        _verifyAttestationFrom(t.signer, a, signature);
         if (
             a.chainId != block.chainid || a.fromBlock != v.startBlock || a.toBlock != v.endBlock
                 || a.panelSize < t.panelSize || a.quorum < t.quorum || a.quorum > a.panelSize || a.agreed < a.quorum
@@ -432,7 +449,9 @@ contract PinkyVaultV2 is OracleAttestationConsumer, ReentrancyGuard {
     }
 
     /// @notice Sends the fees taken so far to the fee sink. Anyone may call. If the sink refuses
-    /// (PinkyStaking does while nobody is staked), the fees stay here for the next try.
+    /// (PinkyStaking does while nobody is staked), the fees stay here for the next try. A sink that
+    /// takes less than the fees without refusing makes this call revert instead, and keep reverting
+    /// until a new sink is enacted; the fees wait here either way.
     function sendFees() external nonReentrant {
         uint256 amount = fees;
         if (amount == 0) return;
@@ -452,8 +471,10 @@ contract PinkyVaultV2 is OracleAttestationConsumer, ReentrancyGuard {
 
     // ───────────────────────── settings, behind a delay ─────────────────────────
 
+    /// @dev The constructor cannot check for code (it runs on an empty chain in the launch checks);
+    /// a proposal can, and an Intake without code would stop `make` and `ask` for a week.
     function proposeProtocol(address intake_, bytes32 action_) external onlyOwner {
-        if (intake_ == address(0) || action_ == bytes32(0)) revert InvalidConfiguration();
+        if (intake_.code.length == 0 || action_ == bytes32(0)) revert InvalidConfiguration();
         _propose(Setting.Protocol, bytes32(uint256(uint160(intake_))), action_);
     }
 
@@ -509,15 +530,13 @@ contract PinkyVaultV2 is OracleAttestationConsumer, ReentrancyGuard {
     function _close(uint256 id) private {
         Promise storage v = _promise(id);
         if (v.status != Status.Active) revert WrongStatus();
-        if (block.timestamp < uint256(v.endTime) + CLOSE_GRACE) revert TooEarly();
-        uint256 head = _chainBlock();
-        // The window must end 32 blocks behind the head and still cover the whole term. On a chain
-        // that only mints blocks when there are transactions, a quiet term can have fewer than 32
-        // blocks since make; closing then would end the window at its own start and judge the
-        // promise on nothing. Refuse until the blocks exist (this call mints one of them).
-        if (head < uint256(v.startBlock) + SETTLE_DELAY_BLOCKS) revert TooEarly();
+        uint256 due = uint256(v.endTime) + (msg.sender == v.maker ? 0 : CLOSE_GRACE);
+        if (block.timestamp < due) revert TooEarly();
+        // The window ends at this block, as in the first vault. Nothing earlier is known to lie at
+        // or past the deadline: on a chain that mints a block only when a transaction arrives, the
+        // block before this one can be from inside the term.
         v.status = Status.Closed;
-        v.endBlock = uint64(head - SETTLE_DELAY_BLOCKS);
+        v.endBlock = uint64(_chainBlock());
         v.closedAt = uint64(block.timestamp);
         emit Closed(id, v.endBlock);
     }
@@ -526,6 +545,12 @@ contract PinkyVaultV2 is OracleAttestationConsumer, ReentrancyGuard {
         Promise storage v = promises[id];
         if (_chainBlock() < uint256(v.endBlock) + SETTLE_DELAY_BLOCKS) revert TooEarly();
         if (v.attempts >= MAX_ATTEMPTS) revert NoAttemptsLeft();
+        // Once the bond could be refunded, only the parties may spend it on another ask: a stranger
+        // could otherwise ask in the refund's own block and push the refund back a day, three times.
+        if (
+            block.timestamp >= uint256(v.closedAt) + REFUND_GRACE && msg.sender != v.maker
+                && msg.sender != v.beneficiary
+        ) revert NotAParty();
 
         IIntakeV2 intake_ = intake;
         bytes32 action_ = action;
@@ -544,6 +569,7 @@ contract PinkyVaultV2 is OracleAttestationConsumer, ReentrancyGuard {
         v.askedAt = uint64(block.timestamp);
         if (v.asker == address(0) || v.asker == v.maker) v.asker = msg.sender;
         v.intake = address(intake_);
+        t.signer = oracleSigner;
         if (t.panelSize == 0 || panelSize < t.panelSize) t.panelSize = panelSize;
         if (t.quorum == 0 || quorum < t.quorum) t.quorum = quorum;
 
@@ -666,6 +692,31 @@ contract PinkyVaultV2 is OracleAttestationConsumer, ReentrancyGuard {
             "}}"
         );
         return (question, recipe, "uint256");
+    }
+
+    /// @dev `_verifyAttestation`, also accepting the signer the request was bought under when the
+    /// owner has rotated it since: a rotation applies to requests bought after it, and the answer
+    /// to one already in flight, signed by the key it was bought under, is not lost with its fee.
+    function _verifyAttestationFrom(
+        address boughtUnder,
+        OracleAttestation.Attestation calldata a,
+        bytes calldata signature
+    ) private view {
+        address current = oracleSigner;
+        if (boughtUnder == current || boughtUnder == address(0)) {
+            _verifyAttestation(a, signature);
+            return;
+        }
+        // The same checks as `_verifyAttestation`, over either key.
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp > a.expiresAt) revert AttestationExpired(a.expiresAt);
+        // forge-lint: disable-next-line(block-timestamp)
+        if (a.issuedAt > block.timestamp + ISSUED_AT_TOLERANCE) revert AttestationNotYetValid(a.issuedAt);
+        bytes32 digest = attestationDigest(a);
+        if (
+            !SignatureChecker.isValidSignatureNowCalldata(boughtUnder, digest, signature)
+                && !SignatureChecker.isValidSignatureNowCalldata(current, digest, signature)
+        ) revert BadSignature();
     }
 
     function _propose(Setting setting, bytes32 data, bytes32 extra) private {

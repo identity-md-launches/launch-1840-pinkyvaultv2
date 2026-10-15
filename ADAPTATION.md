@@ -44,7 +44,51 @@ before submission) before the fix.
 
 | Finding | File | Change | Test |
 | --- | --- | --- | --- |
-| [low] `close` collapses the judged window to the make block when fewer than 32 chain blocks have passed since `make` | `src/PinkyVaultV2.sol` `_close` | Reproduced: with the head 20 blocks past `make`, `settle` reverted `TooEarly` but `close` succeeded and recorded `endBlock == startBlock`, a one-block window that left the whole term out. `_close` now reverts `TooEarly` until the head is at least 32 blocks past `startBlock`, as the audit proposed, so `close` and `settle` agree and the window always ends 32 blocks behind the head. No other behaviour changed; every existing test passes unchanged. The remaining limit, that the 32 blocks before `close` are never in the window, is the design's and is documented in the README. | `test/PinkyVaultV2.t.sol`: `test_CloseRefusesUntilThirtyTwoBlocksExistBehindTheHead` |
+| [low] `close` collapses the judged window to the make block when fewer than 32 chain blocks have passed since `make` | `src/PinkyVaultV2.sol` `_close` | Reproduced: with the head 20 blocks past `make`, `settle` reverted `TooEarly` but `close` succeeded and recorded `endBlock == startBlock`, a one-block window that left the whole term out. The first round's fix (refuse to close until 32 blocks exist behind the head) was replaced in the revision below by the first vault's design: the window now ends at the closing block itself, so there is nothing to collapse and the guard is gone. A term with five blocks in it closes with the window [make, close]. | `test/PinkyVaultV2.t.sol`: `test_AShortQuietTermStillClosesAtTheHead`, `test_TheWindowCoversTheWholeTermOnAQuietChain` |
+
+## Launch review findings (revision)
+
+The launch's independent review reopened the work with one reproducible finding and seven
+advisory ones. Each was reproduced on the accepted tree before anything changed: the reviewer's
+proof `Proof_92eac51fecc7.t.sol` failed on it (run from `test/scratch/`, "window ends before a
+block of the term: 1009 < 1010") and passes on this tree; the three advisory findings changed below
+were reproduced in a scratch probe first. The answers are in `.imd-responses.json`.
+
+| Finding | File | Change | Test |
+| --- | --- | --- | --- |
+| [medium] `close`/`settle` end the judged window 32 blocks behind the closing head, not at the deadline, so a breach late in the term is cut out on a quiet chain | `src/PinkyVaultV2.sol` `_close`, `settle`, `close`, `ask` | Reproduced exactly as described: on a chain that mints a block only when a transaction arrives, 31 blocks after an in-term transfer left `endBlock = head - 32` before the transfer. The fix is the first vault's design, which the reviewer proposed as the minimal one: `_close` records `endBlock` as the closing block itself (nothing earlier is known to lie past the deadline), and `_ask` keeps its existing wait of 32 blocks after `endBlock` so the oracle gets a confirmed closing block. The one-call `settle` could not survive this (the closing block cannot be 32 blocks old in the transaction that chooses it), so `settle` now does whichever step is next: it closes an Active promise and returns zero, and asks for a Closed one; `close` and `ask` are the same two steps by name. The head-must-be-32-past-make guard from the audit fix above is no longer needed and was removed. | `test/PinkyVaultV2.t.sol`: `test_TheWindowCoversTheWholeTermOnAQuietChain`, `test_SettleClosesAtTheHeadAndAsksThirtyTwoBlocksLater`, `test_SettleUsesTheArbitrumBlockNumber`, `test_CloseAloneThenAsk`; every settlement test now closes, rolls 32 blocks and asks; the reviewer's proof |
+| [low] the judged window has no upper bound tied to the deadline; whoever closes last chooses how much post-term conduct is judged | `src/PinkyVaultV2.sol` `_close`, `CLOSE_GRACE` | Real, and the reviewer's first option is taken: the maker may close from the deadline itself, anyone else two minutes later (`CLOSE_GRACE`, which no longer has its old purpose). A maker who closes on time is judged on the term alone and nobody else can stretch the window first. A maker who does not close is judged until someone does, as in the first vault; the contract cannot know which past block was the first past the deadline, so the README says to close on time. | `test/PinkyVaultV2.t.sol`: `test_TheMakerMayCloseAtTheDeadlineAndOthersAfterTheGrace` |
+| [low] `enact(Signer)` applies to requests already bought and in flight, so the old key's answer is refused and the bond pays another fee after a day | `src/PinkyVaultV2.sol` `Terms`, `_ask`, `onOracleResult`, `_verifyAttestationFrom` | Real (reproduced in a scratch probe). `_ask` records the signer the request is bought under in `terms(id).signer`, and `onOracleResult` accepts a signature from either that signer or the current one, with the same window checks as `_verifyAttestation`, which still runs unchanged when the two are the same. A rotation thus applies to requests bought after it. `terms(id)` gained one trailing field; `promises(id)` is unchanged. The callback still fits the Intake's stipend (`test_EveryVerdictFitsTheIntakesGas`, under 150,000 gas). | `test/PinkyVaultV2.t.sol`: `test_ARequestBoughtUnderTheOldSignerSurvivesARotation` |
+| [low] anyone can re-ask a stranded promise at the moment its refund becomes due, taking 0.5 IMD from the bond and adding a day, three times | `src/PinkyVaultV2.sol` `_ask` | Real (reproduced: the maker ended with 98.5 of 100 IMD at day 10 instead of 100 at day 7). Once `closedAt + REFUND_GRACE` has passed, only the maker or the beneficiary may ask; `NotAParty` otherwise. Before that, asking stays open to anyone, as designed. | `test/PinkyVaultV2.t.sol`: `test_OnlyThePartiesMayAskOnceTheRefundIsDue`, `test_AnyoneMayAskBeforeTheRefundIsDue` |
+| [low] `proposeProtocol` accepts an Intake address without code | `src/PinkyVaultV2.sol` `proposeProtocol` | Real (reproduced: after the enact, `make` reverted). The proposal now requires code at the address, as `proposeFeeSink` does. The constructor still checks nothing, since the launch checks run it on an empty chain. | `test/PinkyVaultV2.t.sol`: `test_ProposeProtocolRefusesAnIntakeWithoutCode` |
+| [info] a fee sink whose `notify` succeeds but pulls less than the fees makes `sendFees` revert until a new sink is enacted | `src/PinkyVaultV2.sol` `sendFees` natspec | Reproduces as described and the behaviour is kept: a sink that takes a different amount than it was offered is refused loudly, and the revert keeps the fees here. The natspec now says so. | none (documentation; the reviewer's own test covers the behaviour) |
+
+### Advisory findings not changed
+
+- **[low] after one seven-day delay the owner can point the vault at an Intake and a signer it
+  controls and decide the verdict of every promise still open.** Reproduces and is the owner role
+  the brief asks for: the oracle-consumer reference requires the Intake, action and signer to be
+  owner-settable, and the seven-day proposal is the requester's chosen protection. Pinning the
+  signer at `make` would strand every open promise on a legitimate rotation, which is the case
+  the setting exists for. Not changed; the README's "A proposal applies to open promises" now
+  states the assumption in full (the owner can decide the verdict of every promise open at the
+  enact; the proposal is the notice and there is no early exit). The `launch.json` notes say the
+  owner "can move no funds": that sentence belongs to the manifest step and should read that the
+  owner moves no funds directly but, through a signer and Intake of its own after seven days'
+  public notice, decides the verdicts of promises then open.
+- **[low] the "no bounty for the maker" rule is bypassed by asking from any other wallet.**
+  Reproduces and cannot be enforced on chain, as the reviewer says. The address comparison stays
+  (it closes the plain path at no cost); the README now says the bounty is a rebate to whoever
+  asks first and the sure penalty is 90% of the remaining bond. The `launch.json` notes' "10% to
+  the first non-maker asker" should read "to the first asker, unless that is the maker's own
+  address"; that file is the manifest step's.
+
+### What the manifest step needs to know
+
+The `launch.json` notes describe the accepted tree's one-call `settle` ("ends the window 32 blocks
+behind the head and pays the Intake ... in the same call"). On this tree the window ends at the
+closing block, the maker may close from the deadline and anyone two minutes later, and the ask is
+a second `settle` (or `ask`) 32 blocks later. Constructor arguments are unchanged.
 
 ## Audit findings not changed
 
@@ -71,12 +115,11 @@ before submission) before the fix.
 ## Checks run
 
 `forge build` and `forge test` with the project's own `foundry.toml` and the verifier's fuzz seed:
-180 tests pass (the 42 second-vault tests including the new one, the first vault's unit, edge and
-invariant tests, staking, the launch token and the protocol's oracle conformance vectors). A
-scratch copy of the protected floor (`create2` of the built `PinkyVaultV2` with the `launch.json`
-arguments on an empty chain 4663, runtime under 24,576 bytes, no DELEGATECALL / CALLCODE /
-SELFDESTRUCT) passes: 18,107 bytes of runtime after the fix, owner and signer read back as given.
-No transaction, key or live read was used.
+185 tests pass (the 47 second-vault tests, the first vault's unit, edge and invariant tests,
+staking, the launch token and the protocol's oracle conformance vectors), plus the reviewer's proof
+from `test/scratch/`. The runtime is 18,533 bytes, under 24,576, and the floor's opcode walk
+(skipping PUSH data) finds no DELEGATECALL / CALLCODE / SELFDESTRUCT; the constructor is unchanged
+and still calls no other contract. No transaction, key or live read was used.
 
 # Launch 1 (#1166): PINKY, PinkyStaking and the first vault
 
