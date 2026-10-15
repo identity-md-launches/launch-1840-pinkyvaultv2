@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pinky · pay for the launch</title>
+<style>
+  :root { --wine:#5E1224; --ivory:#F4EEDD; --pink:#E79AA8; }
+  body { margin:0; background:var(--ivory); color:var(--wine); font:16px/1.6 system-ui, sans-serif; }
+  main { max-width:720px; margin:0 auto; padding:32px 16px 64px; }
+  h1 { font:500 28px/1.2 Georgia, serif; margin:0 0 4px; }
+  p { margin:8px 0; }
+  .card { background:#fff; border:1px solid #D9CFB4; border-radius:12px; padding:16px 20px; margin:16px 0; }
+  button { font:inherit; padding:10px 18px; border-radius:8px; border:1px solid var(--wine); background:var(--wine); color:var(--ivory); cursor:pointer; }
+  button[disabled] { opacity:.4; cursor:default; }
+  button.quiet { background:transparent; color:var(--wine); }
+  .mono { font:13px/1.5 ui-monospace, Consolas, monospace; word-break:break-all; }
+  dl { display:grid; grid-template-columns:max-content 1fr; gap:4px 16px; margin:8px 0; }
+  dt { opacity:.7; } dd { margin:0; }
+  .ok { color:#1d6b3a; } .bad { color:#a11; }
+  #log { white-space:pre-wrap; min-height:1.5em; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Pay for the launch</h1>
+  <p>0.5 IMD on Ethereum buys one <span class="mono">launch.open</span>: the swarm audits the repository, adapts it and deploys on Robinhood Chain. One transaction and two signatures, all in your wallet.</p>
+
+  <div class="card">
+    <dl>
+      <dt>Repository</dt><dd class="mono" id="repo"></dd>
+      <dt>Commit</dt><dd class="mono" id="commit"></dd>
+      <dt>Deploys on</dt><dd id="chain"></dd>
+      <dt>Supply</dt><dd id="split"></dd>
+      <dt>Expected wallet</dt><dd class="mono" id="expFrom"></dd>
+      <dt>Connected</dt><dd class="mono" id="acct">—</dd>
+      <dt>Network</dt><dd id="net">—</dd>
+      <dt>Balance</dt><dd id="bal">—</dd>
+    </dl>
+    <button id="connect">Connect wallet</button>
+  </div>
+
+  <div class="card">
+    <p><b>1.</b> Allow Permit2 to move exactly 0.5 IMD. One Ethereum transaction.</p>
+    <button id="approve" disabled>Approve 0.5 IMD to Permit2</button>
+    <p class="mono" id="approveTx"></p>
+  </div>
+
+  <div class="card">
+    <p><b>2.</b> Quote, sign twice, submit. The quote lasts ten minutes, so sign when the wallet asks.</p>
+    <p>The wallet will show a Permit2 transfer of 0.5 IMD with spender <span class="mono">0x4020…0001</span> (the x402 Permit2 proxy) and recipient <span class="mono" id="payTo"></span>, then a short "QuoteApproval" message.</p>
+    <button id="start" disabled>Get the quote and pay</button>
+    <button id="resign" class="quiet" hidden>Ask the wallet again</button>
+    <p class="mono" id="log"></p>
+    <p id="outcome"></p>
+  </div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const AMOUNT = 500000000000000000n;
+let cfg, account, handled = null, timer = null;
+
+const pad = (hex) => hex.replace(/^0x/, '').toLowerCase().padStart(64, '0');
+const call = (to, data) => ethereum.request({ method: 'eth_call', params: [{ to, data }, 'latest'] });
+const fmt = (wei, digits = 4) => (Number(wei) / 1e18).toFixed(digits);
+
+async function refresh() {
+  const chain = await ethereum.request({ method: 'eth_chainId' });
+  const rightChain = chain === '0x1';
+  const rightAccount = !!account && account.toLowerCase() === cfg.expect.from;
+  $('acct').textContent = account || '—';
+  $('acct').className = 'mono ' + (rightAccount ? 'ok' : 'bad');
+  $('net').textContent = rightChain ? 'Ethereum mainnet' : `Wrong network (${parseInt(chain, 16)}) — switch to Ethereum`;
+  $('net').className = rightChain ? 'ok' : 'bad';
+  if (!(rightChain && rightAccount)) { $('approve').disabled = $('start').disabled = true; return; }
+  const [imd, allowed, eth] = await Promise.all([
+    call(cfg.expect.asset, '0x70a08231' + pad(account)),
+    call(cfg.expect.asset, '0xdd62ed3e' + pad(account) + pad(cfg.expect.permit2)),
+    ethereum.request({ method: 'eth_getBalance', params: [account, 'latest'] }),
+  ]);
+  const enough = BigInt(imd) >= AMOUNT;
+  $('bal').textContent = `${fmt(BigInt(imd))} IMD, ${fmt(BigInt(eth), 5)} ETH`;
+  $('bal').className = enough ? 'ok' : 'bad';
+  const hasAllowance = BigInt(allowed) >= AMOUNT;
+  $('approve').disabled = hasAllowance || !enough;
+  if (hasAllowance) $('approveTx').textContent ||= 'Allowance is in place.';
+  const st = await (await fetch('/api/state')).json();
+  $('start').disabled = !hasAllowance || !enough || !['idle', 'failed'].includes(st.stage);
+}
+
+async function waitReceipt(hash) {
+  for (let i = 0; i < 200; i++) {
+    const r = await ethereum.request({ method: 'eth_getTransactionReceipt', params: [hash] });
+    if (r) return r;
+    await new Promise((ok) => setTimeout(ok, 3000));
+  }
+  throw new Error('No receipt after ten minutes. Check the hash on Etherscan.');
+}
+
+async function sign(pending) {
+  $('resign').hidden = true;
+  try {
+    const signature = await ethereum.request({ method: 'eth_signTypedData_v4', params: [account, pending.typedData] });
+    const r = await fetch('/api/signed', { method: 'POST', body: JSON.stringify({ id: pending.id, signature }) });
+    if (!r.ok) throw new Error((await r.json()).error);
+  } catch (e) {
+    $('outcome').textContent = `Signature not given: ${e.message}`;
+    $('outcome').className = 'bad';
+    $('resign').hidden = false;
+    $('resign').onclick = () => { $('outcome').textContent = ''; sign(pending); };
+  }
+}
+
+async function poll() {
+  const st = await (await fetch('/api/state')).json();
+  $('log').textContent = st.log.join('\n');
+  if (st.pending && st.pending.id !== handled) { handled = st.pending.id; sign(st.pending); }
+  if (st.stage === 'done') {
+    const a = st.result.admission?.result ?? {};
+    $('outcome').className = 'ok';
+    $('outcome').innerHTML = 'Paid and admitted. Job: <a class="mono" target="_blank" rel="noopener"></a>';
+    const link = $('outcome').querySelector('a');
+    link.href = 'https://explorer.imd.fun/jobs/' + a.jobId;
+    link.textContent = a.jobId;
+  } else if (st.stage === 'failed') {
+    $('outcome').className = 'bad';
+    $('outcome').textContent = st.error || `Order ended as ${st.result?.status}.`;
+  }
+  if (['done', 'failed', 'unknown'].includes(st.stage)) { clearInterval(timer); timer = null; $('resign').hidden = true; refresh(); }
+}
+
+$('connect').onclick = async () => {
+  try {
+    if (!window.ethereum) throw new Error('No wallet found in this browser.');
+    [account] = await ethereum.request({ method: 'eth_requestAccounts' });
+    try { await ethereum.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: '0x1' }] }); } catch { /* shown by refresh */ }
+    ethereum.on('chainChanged', refresh);
+    ethereum.on('accountsChanged', (a) => { account = a[0]; refresh(); });
+    await refresh();
+  } catch (e) { $('outcome').textContent = e.message; $('outcome').className = 'bad'; }
+};
+
+$('approve').onclick = async () => {
+  try {
+    $('approve').disabled = true;
+    const data = '0x095ea7b3' + pad(cfg.expect.permit2) + pad('0x' + AMOUNT.toString(16));
+    const hash = await ethereum.request({ method: 'eth_sendTransaction', params: [{ from: account, to: cfg.expect.asset, data }] });
+    $('approveTx').textContent = hash + ' — waiting…';
+    const r = await waitReceipt(hash);
+    $('approveTx').textContent = hash + (r.status === '0x1' ? ' — confirmed' : ' — REVERTED');
+  } catch (e) { $('approveTx').textContent = e.message; }
+  await refresh();
+};
+
+$('start').onclick = async () => {
+  $('start').disabled = true;
+  $('outcome').textContent = '';
+  const r = await fetch('/api/start', { method: 'POST', body: JSON.stringify({ account }) });
+  if (!r.ok) { $('outcome').textContent = (await r.json()).error; $('outcome').className = 'bad'; return refresh(); }
+  timer = setInterval(poll, 1000);
+};
+
+fetch('/api/config').then((r) => r.json()).then((c) => {
+  cfg = c;
+  $('repo').textContent = c.input.repoUrl;
+  $('commit').textContent = c.input.baseCommit;
+  $('chain').textContent = `chain ${c.input.chainId}, paired with ${String(c.input.pairWith).toUpperCase()}, kind ${c.input.onchain}`;
+  const pool = c.input.economics.poolBps / 100;
+  $('split').textContent = `${pool}% pool, ${90 - pool}% to ${c.input.economics.remainderTo}, 10% swarm`;
+  $('expFrom').textContent = c.expect.from;
+  $('payTo').textContent = c.expect.payTo;
+});
+</script>
+</body>
+</html>

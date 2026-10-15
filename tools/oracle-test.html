@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pinky · oracle test</title>
+<style>
+  :root { --wine:#5E1224; --ivory:#F4EEDD; --pink:#E79AA8; }
+  body { margin:0; background:var(--ivory); color:var(--wine); font:16px/1.6 system-ui, sans-serif; }
+  main { max-width:680px; margin:0 auto; padding:32px 16px 64px; }
+  h1 { font:500 28px/1.2 Georgia, serif; margin:0 0 4px; }
+  p { margin:8px 0; }
+  .card { background:#fff; border:1px solid #D9CFB4; border-radius:12px; padding:16px 20px; margin:16px 0; }
+  button { font:inherit; padding:10px 18px; border-radius:8px; border:1px solid var(--wine); background:var(--wine); color:var(--ivory); cursor:pointer; }
+  button[disabled] { opacity:.4; cursor:default; }
+  code, .mono { font:13px/1.5 ui-monospace, Consolas, monospace; word-break:break-all; }
+  dl { display:grid; grid-template-columns:max-content 1fr; gap:4px 16px; margin:8px 0; }
+  dt { opacity:.7; } dd { margin:0; }
+  .ok { color:#1d6b3a; } .bad { color:#a11; }
+  #log { white-space:pre-wrap; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Oracle test</h1>
+  <p>One paid question to the IdentityMD oracle on Robinhood Chain: 0.5 IMD. Two transactions, both signed in your wallet.</p>
+
+  <div class="card">
+    <dl>
+      <dt>Expected wallet</dt><dd class="mono" id="expFrom"></dd>
+      <dt>Connected</dt><dd class="mono" id="acct">—</dd>
+      <dt>Network</dt><dd id="net">—</dd>
+      <dt>IMD (Robinhood)</dt><dd class="mono" id="imd"></dd>
+      <dt>Intake</dt><dd class="mono" id="intake"></dd>
+      <dt>Expected answer</dt><dd class="mono" id="exp"></dd>
+    </dl>
+    <button id="connect">Connect wallet</button>
+  </div>
+
+  <div class="card">
+    <p><b>1.</b> Allow the Intake to take exactly 0.5 IMD.</p>
+    <button id="approve" disabled>Approve 0.5 IMD</button>
+    <p class="mono" id="approveTx"></p>
+  </div>
+
+  <div class="card">
+    <p><b>2.</b> Ask. The Intake pulls the 0.5 IMD and emits the question.</p>
+    <button id="ask" disabled>Send the question</button>
+    <p class="mono" id="askTx"></p>
+    <p id="follow"></p>
+  </div>
+
+  <div class="card">
+    <p>The question body</p>
+    <p class="mono" id="body"></p>
+  </div>
+
+  <p id="log"></p>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const CHAIN_HEX = '0x1237'; // 4663
+let cfg, account;
+
+const log = (text, cls = '') => { $('log').textContent = text; $('log').className = cls; };
+
+async function waitReceipt(hash) {
+  for (let i = 0; i < 120; i++) {
+    const r = await ethereum.request({ method: 'eth_getTransactionReceipt', params: [hash] });
+    if (r) return r;
+    await new Promise((ok) => setTimeout(ok, 1500));
+  }
+  throw new Error('No receipt after three minutes. Check the hash in the explorer.');
+}
+
+async function allowance() {
+  const data = '0xdd62ed3e' + account.slice(2).padStart(64, '0') + cfg.intake.slice(2).padStart(64, '0');
+  return BigInt(await ethereum.request({ method: 'eth_call', params: [{ to: cfg.imd, data }, 'latest'] }));
+}
+
+async function refresh() {
+  const chain = await ethereum.request({ method: 'eth_chainId' });
+  const rightChain = chain === CHAIN_HEX;
+  const rightAccount = account && account.toLowerCase() === cfg.from.toLowerCase();
+  $('acct').textContent = account || '—';
+  $('acct').className = 'mono ' + (rightAccount ? 'ok' : 'bad');
+  $('net').textContent = rightChain ? 'Robinhood Chain (4663)' : `Wrong network (${parseInt(chain, 16)}) — switch to 4663`;
+  $('net').className = rightChain ? 'ok' : 'bad';
+  const ready = rightChain && rightAccount;
+  const allowed = ready ? await allowance() : 0n;
+  $('approve').disabled = !ready || allowed >= 500000000000000000n;
+  $('ask').disabled = !ready || allowed < 500000000000000000n;
+  if (ready && allowed >= 500000000000000000n) $('approveTx').textContent ||= 'Allowance is in place.';
+}
+
+$('connect').onclick = async () => {
+  try {
+    if (!window.ethereum) throw new Error('No wallet found in this browser.');
+    [account] = await ethereum.request({ method: 'eth_requestAccounts' });
+    try { await ethereum.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: CHAIN_HEX }] }); } catch (e) { /* shown by refresh */ }
+    ethereum.on('chainChanged', refresh);
+    ethereum.on('accountsChanged', (a) => { account = a[0]; refresh(); });
+    await refresh();
+    log('');
+  } catch (e) { log(e.message, 'bad'); }
+};
+
+$('approve').onclick = async () => {
+  try {
+    $('approve').disabled = true;
+    const hash = await ethereum.request({ method: 'eth_sendTransaction', params: [{ from: account, to: cfg.imd, data: cfg.approve }] });
+    $('approveTx').textContent = hash + ' — waiting…';
+    const r = await waitReceipt(hash);
+    $('approveTx').textContent = hash + (r.status === '0x1' ? ' — confirmed' : ' — REVERTED');
+    await refresh();
+  } catch (e) { log(e.message, 'bad'); await refresh(); }
+};
+
+$('ask').onclick = async () => {
+  try {
+    $('ask').disabled = true;
+    const hash = await ethereum.request({ method: 'eth_sendTransaction', params: [{ from: account, to: cfg.intake, data: cfg.request }] });
+    $('askTx').textContent = hash + ' — waiting…';
+    const r = await waitReceipt(hash);
+    $('askTx').textContent = hash + (r.status === '0x1' ? ' — confirmed' : ' — REVERTED');
+    if (r.status === '0x1') {
+      const url = 'https://api.imd.fun/intake/4663/' + hash;
+      $('follow').innerHTML = 'Follow it: <a class="mono" target="_blank" rel="noopener"></a>';
+      $('follow').querySelector('a').href = url;
+      $('follow').querySelector('a').textContent = url;
+    }
+  } catch (e) { log(e.message, 'bad'); await refresh(); }
+};
+
+// ?c=oracle-test2.calldata.json picks another prepared question; the first test is the default.
+const file = new URLSearchParams(location.search).get('c') || 'oracle-test.calldata.json';
+if (!/^[\w.-]+\.calldata\.json$/.test(file)) throw new Error('Not a calldata file: ' + file);
+fetch(file).then((r) => r.json()).then((c) => {
+  cfg = c;
+  $('expFrom').textContent = c.from;
+  $('imd').textContent = c.imd;
+  $('intake').textContent = c.intake;
+  $('exp').textContent = c.expectedLabel || c.expectedSumWei + ' wei (6.2152 IMD)';
+  $('body').textContent = c.body;
+}).catch((e) => log('Could not load the calldata: ' + e.message, 'bad'));
+</script>
+</body>
+</html>

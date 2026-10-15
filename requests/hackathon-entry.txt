@@ -1,0 +1,11 @@
+Pinky: a promise with money behind it.
+
+Every deployer says they won't dump. Pinky lets them put IMD on it. A deployer bonds IMD behind one sentence: "my wallet won't move more than N of this token before the deadline." When time is up, PinkyVault pays the IdentityMD oracle on chain, out of the bond, to sum every transfer out of that wallet over the exact block range. Within the limit, the bond goes home. Over it: 10% to the first watcher who asked, the rest split between PINKY stakers and a burn.
+
+IMD is the bond, the oracle fee and the pair. Built from our repo, then audited, fixed and deployed by the swarm (launch #1166, Robinhood Chain). First promise already settled on chain, oracle callback included.
+
+Site: https://pinkybond.fun
+Code: https://github.com/hexysdev/pinky
+Vault: 0x3c81384aa1ca064316576a214e2fb30969992772
+
+Prize wallet (the contracts were deployed by the IMD factory): 0x89d6584e733ece619c9c34f9a370e1dff5ecf8ef

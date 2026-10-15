@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="400" height="400">
+  <title>Pinky</title>
+  <rect width="400" height="400" fill="#5E1224"/>
+  <g transform="translate(11,11) scale(2.1)" fill="none" stroke-width="13" stroke-linecap="round">
+    <path d="M66 44 V92 A16 16 0 0 0 98 92 V84" stroke="#F4EEDD"/>
+    <path d="M114 136 V88 A16 16 0 0 0 82 88 V96" stroke="#E79AA8"/>
+  </g>
+</svg>

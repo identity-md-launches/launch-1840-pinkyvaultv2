@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pinky — a promise with money behind it</title>
+<meta name="description" content="Say you won&#39;t sell, and put IMD on it. Pinky holds the bond until the IdentityMD oracle says you kept your word.">
+<link rel="canonical" href="https://pinkybond.fun/">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://pinkybond.fun/">
+<meta property="og:title" content="Pinky — a promise with money behind it">
+<meta property="og:description" content="Say you won&#39;t sell, and put IMD on it. Pinky holds the bond until the IdentityMD oracle says you kept your word.">
+<meta property="og:image" content="https://pinkybond.fun/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#5E1224">
+<link rel="icon" href="mark.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght,SOFT,WONK@0,9..144,400..700,100,1;1,9..144,400..700,100,1&family=Nunito:wght@400;600;700&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="#">
+    <svg viewBox="40 30 100 120" aria-hidden="true"><g fill="none" stroke-width="13" stroke-linecap="round"><path d="M66 44 V92 A16 16 0 0 0 98 92 V84" style="stroke:var(--ivory)"/><path d="M114 136 V88 A16 16 0 0 0 82 88 V96" style="stroke:var(--pink)"/></g></svg>
+    <span>pinky</span>
+  </a>
+  <nav>
+    <a href="#make">Make a promise</a>
+    <a href="#board">Promises</a>
+    <a href="#stake">Stake</a>
+    <a href="#how">How it works</a>
+    <a href="#faq">FAQ</a>
+    <a id="buyTop" class="nav-get" target="_blank" rel="noopener">Get PINKY</a>
+  </nav>
+  <button id="connect" class="btn ghost">Connect wallet</button>
+</header>
+
+<section class="hero">
+  <div class="hero-bg" aria-hidden="true"><svg class="hero-hooks" viewBox="40 30 100 120"><g fill="none" stroke-width="13" stroke-linecap="round"><path class="h1" d="M66 44 V92 A16 16 0 0 0 98 92 V84"/><path class="h2" d="M114 136 V88 A16 16 0 0 0 82 88 V96"/></g></svg></div>
+  <div class="wrap hero-grid">
+    <div class="pitch">
+      <h1>A promise with money behind it.</h1>
+      <p class="lede">Anyone can say they won't sell. Here you <mark>put IMD on it.</mark> Keep your word and it comes home. Break it and it doesn't.</p>
+      <dl class="stats" id="stats">
+        <div><dt>Promises made</dt><dd data-stat="made">—</dd></div>
+        <div><dt>Kept</dt><dd data-stat="kept">—</dd></div>
+        <div><dt>Broken</dt><dd data-stat="broken">—</dd></div>
+        <div><dt>IMD on the line</dt><dd data-stat="locked">—</dd></div>
+      </dl>
+    </div>
+
+    <form id="form" class="form">
+      <h2 id="make">Pinky promise?</h2>
+      <p class="fine">It's about your own wallet, the one you connect.</p>
+      <label>Token you won't move<input name="token" placeholder="0x…" autocomplete="off" required></label>
+      <label>At most this many tokens out<input name="maxOut" inputmode="decimal" placeholder="0" value="0" required></label>
+      <label>For how long
+        <span class="row"><input name="duration" inputmode="numeric" value="30" required><select name="unit"><option value="60">minutes</option><option value="3600">hours</option><option value="86400">days</option></select></span>
+      </label>
+      <label>Bond, in IMD<input name="bond" inputmode="decimal" placeholder="5" required></label>
+      <div class="sum" id="formSum" aria-live="polite"></div>
+      <button class="btn pink" id="submit" type="submit">Make the promise</button>
+      <p class="fine">Your wallet will ask twice: first to let the vault take the bond, then to make the promise. On Robinhood Chain, for 10 minutes to 30 days.</p>
+      <p class="fine" id="needImd">No IMD yet? <a id="getImd" target="_blank" rel="noopener">Get it on Uniswap</a>.</p>
+      <p id="formMsg" class="msg"></p>
+    </form>
+  </div>
+</section>
+
+<main class="wrap">
+  <p id="notice" class="notice" hidden></p>
+
+  <section id="board">
+    <h2>Promises</h2>
+    <p class="sub">Newest first. Anyone can close a promise once its time is up, ask the oracle, and pay it out. <a id="minePromises" href="#" hidden>Show only mine</a></p>
+    <p id="walletView" class="wallet-view" hidden></p>
+    <div id="cards" class="cards"><p class="empty">Reading the chain…</p></div>
+  </section>
+
+  <section id="stake">
+    <h2>Stake PINKY</h2>
+    <p class="sub">When someone breaks a promise, part of their bond is streamed to PINKY stakers over seven days. No lock: take your tokens back whenever you like.</p>
+    <div class="pool">
+      <dl class="pool-stats">
+        <div><dt>Staked by everyone</dt><dd id="poolTotal">—</dd></div>
+        <div><dt>Streaming to stakers</dt><dd id="poolStream">—</dd></div>
+        <div><dt>Your stake</dt><dd id="myStake">—</dd></div>
+        <div><dt>Yours to claim</dt><dd id="myEarned">—</dd></div>
+      </dl>
+      <p id="stakeWarn" class="warn" hidden></p>
+      <div class="pool-actions">
+        <input id="stakeAmount" inputmode="decimal" placeholder="How many PINKY" autocomplete="off" aria-label="How many PINKY">
+        <button class="btn" id="stakeBtn" type="button">Stake</button>
+        <button class="btn light" id="unstakeBtn" type="button">Unstake</button>
+        <button class="btn light" id="claimBtn" type="button">Claim IMD</button>
+      </div>
+      <p class="fine" id="poolHint"></p>
+      <p id="poolMsg" class="msg"></p>
+    </div>
+    <p class="fine">Fair warning: this pays only when a promise is broken. If everyone keeps their word, stakers earn nothing, and that's the good outcome.</p>
+    <div class="get">
+      <a class="btn light" id="buy" target="_blank" rel="noopener">Get PINKY on Uniswap</a>
+      <button class="share" id="copyToken" type="button">Copy token address</button>
+      <p class="fine">Robinhood Chain, paired with IMD. It's a new token, so a wallet or Uniswap may show a warning: check the address against this one, and <a id="verified" target="_blank" rel="noopener">read the verified code</a> before you trust it.</p>
+    </div>
+  </section>
+
+  <section id="who">
+    <h2>Whose word?</h2>
+    <p class="sub">Anyone who holds a token and wants to be believed when they say they'll keep holding it.</p>
+    <ul class="who-list">
+      <li><h3>The one who launched it</h3><p><em>“The team's tokens stay put for the first week.”</em></p></li>
+      <li><h3>The one who holds a lot</h3><p><em>“I'm not selling into this. Watch my wallet.”</em></p></li>
+      <li><h3>The one who was paid in it</h3><p><em>“I got these for the post. I'm holding them for a month.”</em></p></li>
+    </ul>
+  </section>
+
+  <section id="how">
+    <h2>How it works</h2>
+    <ol class="steps">
+      <li><h3>Put IMD on it</h3><p>Pick a token you hold, a limit and a deadline, and lock IMD behind one sentence: <em>my wallet won't move more than this before then.</em></p></li>
+      <li><h3>Time runs out</h3><p>Anyone closes the promise. That fixes the exact block range it covered, start to finish.</p></li>
+      <li><h3>The swarm counts</h3><p>The contract pays the IdentityMD oracle 0.5 IMD out of the bond. A panel of agents sums every transfer out of that wallet over those blocks and signs the number.</p></li>
+      <li><h3>The number decides</h3><p>Within the limit: the bond goes home. Over it: a tenth goes to the first watcher who asked, and the rest is split between PINKY stakers and a burn.</p></li>
+    </ol>
+    <p class="fine">A promise covers one wallet and one ordinary token (ERC-20; NFTs aren't supported yet), and nobody can pause or edit it once it's made. If the oracle can't answer after three tries, the bond is returned.</p>
+    <p class="fine">Before launch the IdentityMD swarm audited the contracts: one audit of the code as written, four specialist audits and a judge. What they found was fixed, and <a href="https://github.com/hexysdev/pinky/blob/main/ADAPTATION.md" target="_blank" rel="noopener">the list is public</a>, as are <a href="https://api.imd.fun/jobs/13613dc2-172f-4b34-b1a6-17de4f20f4df" target="_blank" rel="noopener">the swarm's own record of the job</a> and <a href="https://github.com/identity-md-launches/launch-1166-pinkystaking-pinkyvault" target="_blank" rel="noopener">the code exactly as it was deployed</a>. That is a review by AI agents, not an audit by an outside firm, so read the contracts before you trust them.</p>
+  </section>
+
+  <section id="faq">
+    <h2>Questions people ask</h2>
+    <div class="faq">
+      <details><summary>Is this a locker?</summary><p>No. A locker takes your tokens away. Pinky never touches them: they stay in your wallet and you can sell any minute. What you lock is IMD, and selling costs you that.</p></details>
+      <details><summary>What counts as moving?</summary><p>Every transfer of that token out of the wallet: a sale, a send to your other wallet, a deposit into staking or a pool. Tokens coming in don't count.</p></details>
+      <details><summary>What if I sell from another wallet?</summary><p>Then the promise doesn't see it. A promise covers one wallet, the one that made it. That's why the board says whose wallet it is and how much it holds.</p></details>
+      <details><summary>Who decides whether I kept it?</summary><p>The IdentityMD oracle. A panel of agents sums every transfer out of the wallet over the exact blocks the promise covered, and the contract only accepts a number the oracle has signed. Nobody here can overrule it.</p></details>
+      <details><summary>What does it cost?</summary><p>One oracle question, 0.5 IMD, taken from the bond when someone asks. Keep your word and the rest comes home. Plus gas on Robinhood Chain for your two signatures.</p></details>
+      <details><summary>Can I cancel or change a promise?</summary><p>No. Not you, not us. Once it's made, it runs until the deadline, and it keeps counting until someone closes it, so close it yourself when the time is up.</p></details>
+      <details><summary>What if the oracle doesn't answer?</summary><p>Anyone can ask again after a day, three times in all. After three failed tries, or a week after closing, the rest of the bond goes back to you.</p></details>
+      <details><summary>Who can change the contracts?</summary><p>Nobody can change the code. The vault's owner can point it at another oracle signer or Intake, which is a real trust point: the owner is <span class="mono">0x89d6…f8ef</span>, the team's wallet. Staking has no owner at all.</p></details>
+      <details><summary>Does it work for NFTs?</summary><p>Not yet. A promise counts amounts, and an NFT transfer carries a token id instead. The form refuses an NFT address so nobody gets a promise that can't be judged.</p></details>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">
+  <div class="wrap">
+    <dl id="addresses"></dl>
+    <p><a id="gh" target="_blank" rel="noopener">Source</a><span id="xl" hidden> · <a target="_blank" rel="noopener"></a></span> · <a href="https://github.com/hexysdev/pinky/blob/main/ADAPTATION.md" target="_blank" rel="noopener">Audited by the IdentityMD swarm</a> · Built on the IdentityMD oracle.</p>
+  </div>
+</footer>
+
+<dialog id="wallets" class="wallets">
+  <h2 id="walletsTitle">Which wallet?</h2>
+  <div id="walletList" class="wallet-list"></div>
+  <form method="dialog" class="wallets-foot">
+    <button class="btn light small" value="cancel">Cancel</button>
+    <button class="btn small" id="walletOff" type="button" hidden>Disconnect</button>
+  </form>
+</dialog>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
