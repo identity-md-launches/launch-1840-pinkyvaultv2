@@ -137,8 +137,14 @@ contract PinkyVaultV2Test is Test {
         uint256 d = _make(PinkyVaultV2.Kind.Moves, address(0), address(0));
         assertEq(vault.count(), 4);
         assertEq(imd.balanceOf(address(vault)), 4 * BOND);
-        (address m, address t, PinkyVaultV2.Kind kind,,,, uint256 amount, address target, address beneficiary,,,,,,,,,,,)
-        = vault.promises(b);
+        (
+            address m,
+            address t,
+            PinkyVaultV2.Kind kind,,,,
+            uint256 amount,
+            address target,
+            address beneficiary,,,,,,,,,,,
+        ) = vault.promises(b);
         assertEq(m, maker);
         assertEq(t, address(token));
         assertEq(uint8(kind), uint8(PinkyVaultV2.Kind.Pay));
@@ -231,6 +237,33 @@ contract PinkyVaultV2Test is Test {
         (uint64 startBlock, uint64 endBlock) = _window(id);
         assertEq(startBlock, 84_000_000);
         assertEq(endBlock, 84_039_968);
+    }
+
+    /// A quiet chain can have fewer than 32 blocks since `make` when the term ends. Closing then
+    /// would record the one-block window [startBlock, startBlock] and judge the whole term on
+    /// nothing: `close` refuses until the blocks exist, as `settle` already did.
+    function test_CloseRefusesUntilThirtyTwoBlocksExistBehindTheHead() public {
+        uint256 id = _keep();
+        vm.warp(vm.getBlockTimestamp() + 1 hours + vault.CLOSE_GRACE());
+        // 20 blocks since make: the window would collapse to its start.
+        vm.roll(1_020);
+        vm.expectRevert(PinkyVaultV2.TooEarly.selector);
+        vault.close(id);
+        vm.expectRevert(PinkyVaultV2.TooEarly.selector);
+        vault.settle(id);
+        assertEq(uint8(_status(id)), uint8(PinkyVaultV2.Status.Active));
+        vm.roll(1_031);
+        vm.expectRevert(PinkyVaultV2.TooEarly.selector);
+        vault.close(id);
+        // Exactly 32 blocks behind the head: the earliest the window can end, at its own start.
+        vm.roll(1_032);
+        vault.close(id);
+        (uint64 startBlock, uint64 endBlock) = _window(id);
+        assertEq(startBlock, 1_000);
+        assertEq(endBlock, 1_000);
+        vm.prank(watcher);
+        vault.ask(id);
+        assertEq(uint8(_status(id)), uint8(PinkyVaultV2.Status.Asked));
     }
 
     function test_CloseAloneThenAsk() public {

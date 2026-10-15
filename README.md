@@ -78,6 +78,35 @@ manifest is `launch.json` (the first launch's is kept in `launches/1166-launch.j
 
 Tests: `test/PinkyVaultV2.t.sol`.
 
+Launch (`launch.json`): Robinhood Chain (chain id 4663), contracts only, no token and no pool.
+The owner is the launch's `$owner`, `0x89d6584e733ece619c9c34f9a370e1dff5ecf8ef`, the wallet that
+made the live oracle tests and promise #1. IMD, PinkyStaking and the minimum bond of 5 IMD are
+immutable; the Intake (version 2), the action, the signer, the panel of seven with a quorum of five
+and the fee sink start from the constructor and change only through a seven-day proposal.
+
+The second vault's own limits, beside those under "Trust and known limits":
+
+- **The window needs 32 blocks.** `close` and `settle` refuse (`TooEarly`) until the chain has
+  minted 32 blocks since `make`, because the window ends 32 blocks behind the head. Robinhood
+  Chain mints a block every few hundred milliseconds while there are transactions, so a term of
+  ten minutes or more has them; on a quiet chain every refused call mints one. The 32 blocks before
+  `close` are never in the window, which is why `close` waits two minutes after the deadline: close
+  promptly, once 32 blocks have followed the deadline, so the blocks left out are after it.
+- **Hold and Moves are untested live.** Only the `log-sum` recipe (Keep, Pay) has a recorded
+  oracle answer (`requests/oracle-test2.body.json`, 2026-10-14). The `call-compare` recipe (Hold)
+  and the `log-count` recipe (Moves) have not been bought from the live oracle. If the oracle
+  refuses one, every promise of that kind pays up to three fees (1.5 IMD) and is refunded without
+  a verdict, and a beneficiary of such a promise is never paid. Before anyone bonds behind a Hold
+  or Moves promise, buy one request of each kind through the Intake from a funded wallet; the
+  bodies the vault sends are printed by `bodyOf(id)` after `close`.
+- **A proposal applies to open promises.** A signer or Intake proposed today takes effect in
+  seven days, inside the term of any promise then open (terms run up to 30 days, and a maker
+  cannot leave early). The owner, with a signer of their own, could then sign any verdict for
+  those promises; with an Intake of their own, route up to three fees per promise, never more per
+  request than the price at `make`. Every pending request signed by the old signer is refused
+  after the change and costs that promise one ask. This is the owner role the brief asks for,
+  held by the wallet above.
+
 ## Where IMD is used
 
 | | |

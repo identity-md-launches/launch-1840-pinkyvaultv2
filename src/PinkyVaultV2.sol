@@ -511,10 +511,13 @@ contract PinkyVaultV2 is OracleAttestationConsumer, ReentrancyGuard {
         if (v.status != Status.Active) revert WrongStatus();
         if (block.timestamp < uint256(v.endTime) + CLOSE_GRACE) revert TooEarly();
         uint256 head = _chainBlock();
-        // A term too short to have 32 blocks behind the head ends at its own start.
-        uint256 end = head < uint256(v.startBlock) + SETTLE_DELAY_BLOCKS ? v.startBlock : head - SETTLE_DELAY_BLOCKS;
+        // The window must end 32 blocks behind the head and still cover the whole term. On a chain
+        // that only mints blocks when there are transactions, a quiet term can have fewer than 32
+        // blocks since make; closing then would end the window at its own start and judge the
+        // promise on nothing. Refuse until the blocks exist (this call mints one of them).
+        if (head < uint256(v.startBlock) + SETTLE_DELAY_BLOCKS) revert TooEarly();
         v.status = Status.Closed;
-        v.endBlock = uint64(end);
+        v.endBlock = uint64(head - SETTLE_DELAY_BLOCKS);
         v.closedAt = uint64(block.timestamp);
         emit Closed(id, v.endBlock);
     }
